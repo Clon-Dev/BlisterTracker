@@ -7,3 +7,5 @@ export const firebaseConfig = {
   appId: process.env.EXPO_PUBLIC_FIREBASE_APP_ID,
 };
 export const vapidKey = process.env.EXPO_PUBLIC_FIREBASE_VAPID_KEY;
+/** Firebase Hosting site: the web app, plus the Android release files under /android/. */
+export const appUrl = `https://${firebaseConfig.projectId}.web.app`;

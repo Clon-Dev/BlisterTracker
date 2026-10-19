@@ -22,7 +22,8 @@ import {
   deviceTz, ensureAccount, fetchHasPassword, hasSchedule, registerToken, setAccountLang, setTaken, setTimezone, todayOf,
   unsubscribe, watchAccount, watchNotes, watchProfile, watchSubscriberCount, type Account, type Notes, type Profile, type Schedule,
 } from "./src/data";
-import { NoteCard, NoteLine, openEarlyPackSheet, SuppliesCard, TravelNotice, type OwnNote } from "./src/HomeCards";
+import { NoteCard, NoteLine, openEarlyPackSheet, SuppliesCard, TravelNotice, UpdateCard, type OwnNote } from "./src/HomeCards";
+import { checkForUpdate, type Release } from "./src/update";
 import { PasswordForm, ScheduleWizard, SubscribeForm } from "./src/Forms";
 import { HistoryScreen } from "./src/HistoryScreen";
 import { formatDay, loadSavedLang, useI18n, type Lang, type Strings } from "./src/i18n";
@@ -119,6 +120,20 @@ function Main({ user }: { user: User }) {
   const [privateNotes, setPrivateNotes] = useState<Notes>({});
   const [followedNotes, setFollowedNotes] = useState<Record<string, Notes>>({});
   const [keptZones, setKeptZones] = useState<string | null>(null);
+  const [release, setRelease] = useState<Release | null>(null);
+
+  // App updates (Android APK): check on start and when the app returns, at most every 6 hours.
+  useEffect(() => {
+    let last = 0;
+    const check = () => {
+      if (Date.now() - last < 6 * 3600_000) return;
+      last = Date.now();
+      checkForUpdate().then(setRelease, () => undefined); // offline: try again next time
+    };
+    check();
+    const sub = AppState.addEventListener("change", (st) => st === "active" && check());
+    return () => sub.remove();
+  }, []);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
 
@@ -240,7 +255,7 @@ function Main({ user }: { user: User }) {
   return (
     // key: each screen starts scrolled to the top; a theme switch redraws everything with the new palette.
     <ScrollView key={`${screen}-${themeVersion}`} contentContainerStyle={scrollContent} keyboardShouldPersistTaps="handled">
-      {screen === "account" && <AccountScreen user={user} account={account} pushToken={pushToken} onBack={home} />}
+      {screen === "account" && <AccountScreen user={user} account={account} pushToken={pushToken} onBack={home} onUpdateFound={setRelease} />}
       {screen === "password" && <PasswordForm pid={account.pid} hasPassword={passwordSet} onSaved={() => { setPasswordSet(true); home(); }} onBack={home} />}
       {screen === "subscribe" && <SubscribeForm uid={uid} ownPid={account.pid} onBack={home} />}
       {screen === "schedule" && <ScheduleWizard uid={uid} pid={account.pid} current={own} width={width} onBack={home} />}
@@ -259,6 +274,8 @@ function Main({ user }: { user: User }) {
           <LanguageSwitch />
           <IconButton icon={UserRound} label={t.account} onPress={() => setScreen("account")} />
         </View>
+
+        {release && <UpdateCard release={release} />}
 
         {!emailVerified && (
           <Notice icon={MailWarning} tone="warning" text={t.verifyBanner({ email: user.email ?? "" })}

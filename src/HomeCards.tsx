@@ -2,14 +2,15 @@
 import { useState } from "react";
 import { Pressable, Text, TextInput, View } from "react-native";
 import {
-  CalendarClock, Check, ChevronRight, Globe2, NotebookPen, Package, SkipForward, Stethoscope, Trash2, type LucideIcon,
+  CalendarClock, Check, ChevronRight, Download, Globe2, NotebookPen, Package, SkipForward, Stethoscope, Trash2, type LucideIcon,
 } from "lucide-react-native";
 import { addDays, clock, isTaken, packsLeft, zonedTime } from "../shared/schedule";
 import { DatePicker } from "./DatePicker";
 import { MOODS, setAppointment, setNote, setSupply, startPackEarly, todayOf, type Note, type Schedule } from "./data";
 import { queued } from "./errors";
 import { formatDay, useI18n, type Lang, type Strings } from "./i18n";
-import { openSheet, SheetIcon, toast } from "./sheets";
+import { alert, openSheet, SheetIcon, toast } from "./sheets";
+import { downloadAndInstall, type Release } from "./update";
 import { C, F, R, themedStyles } from "./theme";
 import { Badge, Button, Card, Field, LinkButton, s, Stepper, Toggle } from "./ui";
 
@@ -191,6 +192,46 @@ export function NoteLine({ note, label, badge }: { note: Note; label?: string; b
   );
 }
 
+// ---------- App update (Android APK) ----------
+
+/** "New version available": downloads the APK with progress and opens the Android installer. */
+export function UpdateCard({ release }: { release: Release }) {
+  const { t } = useI18n();
+  const [progress, setProgress] = useState<number | null>(null);
+  const [installing, setInstalling] = useState(false);
+  const start = async () => {
+    setProgress(0);
+    try {
+      await downloadAndInstall(release, setProgress);
+      setInstalling(true);
+    } catch {
+      alert(t.updateFailed);
+    } finally {
+      setProgress(null);
+    }
+  };
+  return (
+    <Card style={{ borderColor: C.primary, borderWidth: 1.5 }}>
+      <View style={{ flexDirection: "row", gap: 12, alignItems: "center" }}>
+        <View style={[st.rowIcon, { backgroundColor: C.primarySoft }]}><Download size={19} color={C.primaryDeep} strokeWidth={2.4} /></View>
+        <View style={{ flex: 1 }}>
+          <Text style={s.h2}>{t.updateTitle({ version: release.version })}</Text>
+          <Text style={[s.small, { marginTop: 2 }]}>{release.notes || t.updateBody}</Text>
+        </View>
+      </View>
+      {progress !== null ? (
+        <View style={{ marginTop: 16 }}>
+          <View style={st.progressTrack}><View style={[st.progressFill, { width: `${Math.round(progress * 100)}%` }]} /></View>
+          <Text style={[s.small, { textAlign: "center", marginTop: 8 }]}>{t.updateDownloading({ p: Math.round(progress * 100) })}</Text>
+        </View>
+      ) : (
+        <Button title={t.updateButton} icon={Download} onPress={start} />
+      )}
+      <Text style={[s.small, { marginTop: 10, color: C.muted }]}>{installing ? t.updateInstalling : t.updateFirstTime}</Text>
+    </Card>
+  );
+}
+
 // ---------- Travelling ----------
 
 /** Shown when the device is in another time zone than the schedule; offers to switch or keep home time. */
@@ -227,4 +268,6 @@ const st = themedStyles(() => ({
     borderColor: C.border, backgroundColor: C.primaryTint, padding: 14, marginTop: 14 },
   noteLine: { flexDirection: "row" as const, gap: 12, alignItems: "flex-start" as const, paddingVertical: 12, borderTopWidth: 1, borderTopColor: C.border },
   travel: { backgroundColor: C.primarySoft, borderRadius: R.lg, padding: 14, marginTop: 14, gap: 4 },
+  progressTrack: { height: 10, borderRadius: 5, backgroundColor: C.segment, overflow: "hidden" as const },
+  progressFill: { height: "100%" as const, borderRadius: 5, backgroundColor: C.primary },
 }));

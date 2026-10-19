@@ -1,17 +1,18 @@
 import { useState } from "react";
-import { Pressable, Text, View } from "react-native";
+import { Platform, Pressable, Text, View } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import type { User } from "firebase/auth";
-import { AlertCircle, BadgeCheck, ChevronRight, KeyRound, Lock, LogOut, Mail, MailWarning, SunMoon, Trash2, type LucideIcon } from "lucide-react-native";
+import { AlertCircle, BadgeCheck, ChevronRight, KeyRound, Lock, LogOut, Mail, MailWarning, RefreshCw, SunMoon, Trash2, type LucideIcon } from "lucide-react-native";
 import { authErrorText, changeEmail, changePassword, deleteAccount, logout, resendVerification } from "./auth";
 import { deleteAccountData, removeToken, type Account } from "./data";
 import { useI18n } from "./i18n";
 import { confirm, openSheet, SheetIcon, toast } from "./sheets";
+import { checkForUpdate, currentVersion, type Release } from "./update";
 import { C, F, G, R, setAppearance, themedStyles, useAppearance, type Appearance } from "./theme";
 import { Badge, Button, Card, ChipGroup, Field, Header, s } from "./ui";
 
-export function AccountScreen({ user, account, pushToken, onBack }: {
-  user: User; account: Account; pushToken: string | null; onBack: () => void;
+export function AccountScreen({ user, account, pushToken, onBack, onUpdateFound }: {
+  user: User; account: Account; pushToken: string | null; onBack: () => void; onUpdateFound: (r: Release) => void;
 }) {
   const { t } = useI18n();
   const appearance = useAppearance();
@@ -62,10 +63,21 @@ export function AccountScreen({ user, account, pushToken, onBack }: {
         <Row icon={LogOut} title={t.logout} onPress={signOutDevice} last />
       </Card>
 
+      {Platform.OS === "android" && (
+        <Card style={{ padding: 6 }}>
+          <Row icon={RefreshCw} title={t.checkUpdates} last onPress={() => checkForUpdate().then((r) => {
+            if (r) { onUpdateFound(r); onBack(); } else toast(t.upToDate);
+          }, () => toast(t.updateFailed, "error"))} />
+        </Card>
+      )}
+
       <Card style={{ padding: 6 }}>
         <Row icon={Trash2} title={t.deleteAccount} danger last
           onPress={() => openSheet((done) => <DeleteSheet user={user} account={account} done={done} />)} />
       </Card>
+      <Text style={[s.small, { textAlign: "center", marginTop: 18, color: C.muted }]}>
+        Blister Buddy {t.versionLabel({ version: currentVersion().version, code: currentVersion().code })}
+      </Text>
     </View>
   );
 }

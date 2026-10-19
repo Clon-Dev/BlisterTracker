@@ -60,6 +60,23 @@ Why a Worker? Spark can't run Cloud Functions, and sending FCM needs a server ho
 5. **Android APK**: `EAS_NO_VCS=1 npx eas-cli build --platform android --profile preview`, then install the APK from the link EAS prints.
    `.easignore` (not `.gitignore`) decides what gets uploaded. It includes `google-services.json` and `.env`, and excludes the worker and its secrets.
 
+## Releasing an Android update
+
+```sh
+npm run release:android                 # patch version, e.g. 1.1.0 → 1.1.1
+npm run release:android -- --minor      # minor version, e.g. 1.1.x → 1.2.0
+npm run release:android -- "What's new" # optional notes shown in the update card
+```
+
+The script bumps `version` and `android.versionCode` in `app.json`, builds the APK on EAS (and waits), checks that the download is an APK, and stores it with `android/latest.json` in `public/android/`. It then deploys Firebase Hosting.
+
+Installed apps check `latest.json` on start (at most every 6 hours), or via Account → "Check for updates". When a higher `versionCode` is available, the app shows "Version x is available · Update app": it downloads the APK with progress and opens the Android installer. Because every build is signed with the same EAS key, the update installs in place and keeps the login and all app data. The first time, Android asks to allow installs from Blister Buddy.
+
+Notes:
+- `public/android/` is gitignored and excluded from EAS uploads, since the APK is about 70 MB. Firebase Hosting serves only the latest APK.
+- Run web deploys from the machine that holds `public/android/`. A deploy without it would remove the hosted APK.
+- Commit the bumped `app.json` after a release.
+
 ## Development
 
 ```sh
