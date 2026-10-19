@@ -1,0 +1,14 @@
+{
+  "expo": {
+    "name": "Blister Buddy",
+    "slug": "blister-buddy",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "ios": { "supportsTablet": false, "bundleIdentifier": "com.example.blisterbuddy", "googleServicesFile": "./GoogleService-Info.plist" },
+    "android": { "package": "com.example.blisterbuddy", "googleServicesFile": "./google-services.json" },
+    "web": { "bundler": "metro" },
+    "plugins": ["@react-native-firebase/app", "@react-native-firebase/messaging", ["expo-notifications", { "color": "#6454C7", "defaultChannel": "default" }]]
+  }
+}

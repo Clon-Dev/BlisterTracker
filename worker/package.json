@@ -1,0 +1,15 @@
+{
+  "name": "blister-buddy-worker",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "db:migrate:local": "wrangler d1 migrations apply blister-buddy --local",
+    "db:migrate:remote": "wrangler d1 migrations apply blister-buddy --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20261005.0",
+    "wrangler": "^4.40.0",
+    "typescript": "~5.8.3"
+  }
+}

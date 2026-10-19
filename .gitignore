@@ -1,0 +1,13 @@
+node_modules/
+.expo/
+dist/
+web-build/
+functions/node_modules/
+functions/lib/
+worker/.wrangler/
+worker/.dev.vars
+service-account*.json
+firebase-debug.log
+google-services.json
+GoogleService-Info.plist
+.env

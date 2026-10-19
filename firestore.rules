@@ -1,0 +1,7 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // All user data is accessed through authenticated callable functions.
+    match /{document=**} { allow read, write: if false; }
+  }
+}

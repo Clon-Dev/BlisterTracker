@@ -1,0 +1,15 @@
+name = "blister-buddy-api"
+main = "src/index.ts"
+compatibility_date = "2026-10-05"
+
+[vars]
+FIREBASE_PROJECT_ID = "blisterbuddy-8e7a4"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "blister-buddy"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[triggers]
+crons = ["* * * * *"]
