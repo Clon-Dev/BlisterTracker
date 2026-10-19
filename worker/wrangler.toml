@@ -1,15 +1,14 @@
-name = "blister-buddy-api"
+name = "blister-buddy-notifier"
 main = "src/index.ts"
-compatibility_date = "2026-10-05"
+compatibility_date = "2026-10-01"
+workers_dev = false
 
 [vars]
 FIREBASE_PROJECT_ID = "blisterbuddy-8e7a4"
+APP_URL = "https://blisterbuddy-8e7a4.web.app"
 
-[[d1_databases]]
-binding = "DB"
-database_name = "blister-buddy"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
-migrations_dir = "migrations"
+# Secret (set with `npx wrangler secret put SERVICE_ACCOUNT_JSON`):
+#   SERVICE_ACCOUNT_JSON  Firebase Admin SDK service-account key (JSON)
 
 [triggers]
 crons = ["* * * * *"]

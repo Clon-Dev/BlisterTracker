@@ -4,11 +4,43 @@
     "slug": "blister-buddy",
     "version": "1.0.0",
     "orientation": "portrait",
+    "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
-    "newArchEnabled": true,
-    "ios": { "supportsTablet": false, "bundleIdentifier": "com.example.blisterbuddy", "googleServicesFile": "./GoogleService-Info.plist" },
-    "android": { "package": "com.example.blisterbuddy", "googleServicesFile": "./google-services.json" },
-    "web": { "bundler": "metro" },
-    "plugins": ["@react-native-firebase/app", "@react-native-firebase/messaging", ["expo-notifications", { "color": "#6454C7", "defaultChannel": "default" }]]
+    "android": {
+      "package": "com.example.blisterbuddy",
+      "googleServicesFile": "./google-services.json",
+      "adaptiveIcon": {
+        "backgroundColor": "#F4EEF6",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "permissions": [
+        "android.permission.POST_NOTIFICATIONS"
+      ]
+    },
+    "web": {
+      "name": "Blister Buddy",
+      "shortName": "Blister",
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro",
+      "output": "single"
+    },
+    "plugins": [
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#C2577A",
+          "defaultChannel": "default"
+        }
+      ],
+      "expo-localization"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "fcf70d1c-a3ff-4a71-af72-e1c949f1c159"
+      }
+    },
+    "owner": "clonisdev"
   }
 }

@@ -1,191 +1,307 @@
-import React, { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Alert, KeyboardAvoidingView, Platform, Pressable, SafeAreaView, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { useCallback, useEffect, useState } from "react";
+import { ActivityIndicator, AppState, Pressable, ScrollView, Text, useWindowDimensions, View } from "react-native";
+import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
-import { onAuthStateChanged, signInAnonymously, User } from "firebase/auth";
-import { auth, firebaseConfigured } from "./src/firebase";
-import { setupPush, listenForPush } from "./src/push";
-type Schedule = { pillsPerPack: number; pillsTaken: number; reminderTime: string; takenToday: boolean };
-type Subscribed = Schedule & { ownerUid: string; personalId: string };
-type Dashboard = { personalId: string; hasPassword: boolean; own: Schedule | null; subscribed: Subscribed[] };
+import * as Clipboard from "expo-clipboard";
+import { onAuthStateChanged, type User } from "firebase/auth";
+import { auth } from "./src/firebase";
+import { AccountScreen } from "./src/AccountScreen";
+import { setAuthLanguage, resendVerification } from "./src/auth";
+import { AuthScreen } from "./src/AuthScreen";
+import { Blister, packStartWeekday } from "./src/Blister";
+import {
+  dayKey, ensureAccount, fetchHasPassword, hasSchedule, markTaken, packFinished, registerToken, setAccountLang,
+  startNewPack, takenToday, unsubscribe, watchAccount, watchProfile, watchSubscriberCount,
+  type Account, type Profile, type Schedule,
+} from "./src/data";
+import { confirm, notify } from "./src/dialog";
+import { PasswordForm, ScheduleWizard, SubscribeForm } from "./src/Forms";
+import { loadSavedLang, useI18n, type Strings } from "./src/i18n";
+import { enablePush, pushStatus, type PushStatus } from "./src/push";
+import { Button, C, Card, errorText, LanguageSwitch, LinkButton, queued, s } from "./src/ui";
 
-const call = async <T,>(name: string, data: Record<string, unknown> = {}) => {
-  const baseUrl = process.env.EXPO_PUBLIC_API_BASE_URL?.replace(/\/$/, "");
-  if (!baseUrl) throw new Error("Set EXPO_PUBLIC_API_BASE_URL in .env after deploying the API.");
-  const idToken = await auth.currentUser?.getIdToken();
-  if (!idToken) throw new Error("Your sign-in has expired. Restart the app and try again.");
-  const response = await fetch(`${baseUrl}/${name}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${idToken}` },
-    body: JSON.stringify(data),
-  });
-  const result = await response.json() as { error?: string } & T;
-  if (!response.ok) throw new Error(result.error ?? "The server could not complete that request.");
-  return result as T;
-};
+type Screen = "home" | "password" | "subscribe" | "schedule" | "account";
+type Followed = Profile | "denied" | undefined;
 
 export default function App() {
-  const [user, setUser] = useState<User | null>(null);
-  const [dashboard, setDashboard] = useState<Dashboard | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
-  const [password, setPassword] = useState("");
-  const [pillCount, setPillCount] = useState("21");
-  const [pillsTaken, setPillsTaken] = useState("0");
-  const [reminderTime, setReminderTime] = useState("20:00");
-  const [targetId, setTargetId] = useState("");
-  const [targetPassword, setTargetPassword] = useState("");
-  const [editingSchedule, setEditingSchedule] = useState(false);
+  return (
+    <SafeAreaProvider>
+      <SafeAreaView style={{ flex: 1, backgroundColor: C.bg }} edges={["top", "left", "right"]}>
+        <StatusBar style="dark" />
+        <Root />
+      </SafeAreaView>
+    </SafeAreaProvider>
+  );
+}
 
-  const loadDashboard = useCallback(async () => {
-    const result = await call<Dashboard>("getDashboard");
-    setDashboard(result);
-    if (result.own) {
-      setPillCount(String(result.own.pillsPerPack));
-      setPillsTaken(String(result.own.pillsTaken));
-      setReminderTime(result.own.reminderTime);
-    }
+const scrollContent = { padding: 18, paddingBottom: 48, width: "100%", maxWidth: 520, alignSelf: "center" } as const;
+
+const Loading = ({ text }: { text: string }) => (
+  <View style={{ flex: 1, alignItems: "center", justifyContent: "center", gap: 12 }}>
+    <ActivityIndicator size="large" color={C.primary} />
+    <Text style={s.muted}>{text}</Text>
+  </View>
+);
+
+/** Login gate: without an account only the login/register screen is shown. */
+function Root() {
+  const { t, lang } = useI18n();
+  const [user, setUser] = useState<User | null | undefined>(undefined);
+
+  useEffect(() => setAuthLanguage(lang), [lang]);
+  useEffect(() => {
+    let unsub = () => {};
+    loadSavedLang().then(() => { unsub = onAuthStateChanged(auth, setUser); });
+    return () => unsub();
   }, []);
 
-  useEffect(() => onAuthStateChanged(auth, async (current) => {
-    setUser(current);
-    if (!current && firebaseConfigured) {
-      try { await signInAnonymously(auth); } catch (e) { setLoading(false); Alert.alert("Connection issue", errorText(e)); }
+  if (user === undefined) return <Loading text={t.loading} />;
+  if (!user) return (
+    <ScrollView contentContainerStyle={scrollContent} keyboardShouldPersistTaps="handled">
+      <AuthScreen />
+    </ScrollView>
+  );
+  return <Main key={user.uid} user={user} />;
+}
+
+/** Re-renders when the local date changes, so "taken today" flips at midnight even if the app stays open. */
+function useToday() {
+  const [today, setToday] = useState(() => dayKey(new Date()));
+  useEffect(() => {
+    const id = setInterval(() => setToday(dayKey(new Date())), 60_000);
+    return () => clearInterval(id);
+  }, []);
+  return today;
+}
+
+function Main({ user }: { user: User }) {
+  const { t, lang } = useI18n();
+  useToday();
+  const uid = user.uid;
+  const width = Math.min(useWindowDimensions().width, 520);
+  const [account, setAccount] = useState<Account | null>(null);
+  const [own, setOwn] = useState<Profile | null>(null);
+  const [followed, setFollowed] = useState<Record<string, Followed>>({});
+  const [passwordSet, setPasswordSet] = useState(false);
+  const [subscriberCount, setSubscriberCount] = useState(0);
+  const [push, setPush] = useState<PushStatus | null>(null);
+  const [pushToken, setPushToken] = useState<string | null>(null);
+  const [emailVerified, setEmailVerified] = useState(user.emailVerified);
+  const [screen, setScreen] = useState<Screen>("home");
+  const [error, setError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
+
+  // The verification link is opened outside the app; re-check whenever the app comes back.
+  useEffect(() => {
+    if (emailVerified) return;
+    const check = () => user.reload().then(() => setEmailVerified(user.emailVerified), () => undefined);
+    check();
+    const sub = AppState.addEventListener("change", (st) => st === "active" && check());
+    return () => sub.remove();
+  }, [user, emailVerified]);
+
+  useEffect(() => {
+    let unsub = () => {};
+    ensureAccount(uid, lang)
+      .then((a) => { setAccount(a); unsub = watchAccount(uid, setAccount); })
+      .catch((e) => setError(errorText(e)));
+    return () => unsub();
+  }, [attempt]); // eslint-disable-line react-hooks/exhaustive-deps -- uid is fixed per Main; lang only seeds a new account
+
+  // Notifications are sent in the account's language.
+  useEffect(() => {
+    if (account && account.lang !== lang) queued(setAccountLang(uid, lang));
+  }, [uid, account?.lang, lang]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const pid = account?.pid;
+  useEffect(() => {
+    if (!pid) return;
+    const unsubs = [watchProfile(pid, setOwn), watchSubscriberCount(pid, setSubscriberCount)];
+    fetchHasPassword(pid).then(setPasswordSet, () => undefined);
+    return () => unsubs.forEach((u) => u());
+  }, [pid]);
+
+  // One live listener per followed schedule.
+  const subsKey = account?.subs.join(",") ?? "";
+  useEffect(() => {
+    const pids = subsKey ? subsKey.split(",") : [];
+    setFollowed((f) => Object.fromEntries(pids.map((p) => [p, f[p]])));
+    const unsubs = pids.map((p) => watchProfile(p,
+      (profile) => setFollowed((f) => ({ ...f, [p]: profile ?? "denied" })),
+      () => setFollowed((f) => ({ ...f, [p]: "denied" }))));
+    return () => unsubs.forEach((u) => u());
+  }, [subsKey]);
+
+  // Push: silently refresh the token when permission exists; `ask` comes from the button (a user gesture, required on iOS).
+  const refreshPush = useCallback(async (ask: boolean) => {
+    if (!account) return;
+    const status = await pushStatus();
+    setPush(status);
+    if (status !== "granted" && !(ask && status === "default")) return;
+    try {
+      const token = await enablePush();
+      setPush(await pushStatus());
+      setPushToken(token);
+      if (token) await registerToken(uid, account, token);
+      else if (ask) notify(t.pushOffTitle, t.pushOffBody);
+    } catch (e) {
+      if (ask) notify(t.errorTitle, errorText(e));
     }
-    if (current && firebaseConfigured) {
-      try {
-        await call("ensureProfile");
-        await loadDashboard();
-        await setupPush((token) => call("registerDevice", { token }));
-      } catch (e) { Alert.alert("Couldn’t load your account", errorText(e)); }
-      finally { setLoading(false); }
-    }
-  }), [loadDashboard]);
+  }, [uid, account, t]);
 
-  useEffect(() => listenForPush(), []);
+  useEffect(() => { refreshPush(false); }, [pid]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const act = async (work: () => Promise<void>, success?: string) => {
-    setBusy(true);
-    try { await work(); if (success) Alert.alert("Done", success); }
-    catch (e) { Alert.alert("Couldn’t complete that", errorText(e)); }
-    finally { setBusy(false); }
-  };
+  if (error) return (
+    <View style={{ flex: 1, justifyContent: "center", padding: 24 }}>
+      <Text style={s.h2}>{t.errorTitle}</Text>
+      <Text style={[s.muted, { marginTop: 8 }]}>{error}</Text>
+      <Button title={t.tryAgain} onPress={() => { setError(null); setAttempt((n) => n + 1); }} />
+    </View>
+  );
+  if (!account) return <Loading text={t.loading} />;
 
-  const setSchedulePassword = () => act(async () => {
-    await call("setSchedulePassword", { password });
-    setPassword(""); await loadDashboard();
-  }, "Your subscriber password is saved.");
+  const home = () => setScreen("home");
+  const schedule = hasSchedule(own) ? own : null;
 
-  const createSchedule = () => act(async () => {
-    await call("createSchedule", {
-      pillsPerPack: Number(pillCount), pillsTaken: Number(pillsTaken), reminderTime,
-      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
-    });
-    await loadDashboard();
-  }, "Your pill schedule is ready.");
-
-  const subscribe = () => act(async () => {
-    await call("subscribeToSchedule", { personalId: targetId, password: targetPassword });
-    setTargetId(""); setTargetPassword(""); await loadDashboard();
-  }, "You’re subscribed to this schedule.");
-
-  const markTaken = () => act(async () => {
-    await call("markPillTaken"); await loadDashboard();
-  });
-
-  if (!firebaseConfigured || !process.env.EXPO_PUBLIC_API_BASE_URL) return <SetupScreen />;
-  if (loading || !user || !dashboard) return <View style={styles.loading}><ActivityIndicator size="large" color="#6256C7"/><Text style={styles.muted}>Getting your space ready…</Text></View>;
-
-  return <SafeAreaView style={styles.safe}>
-    <StatusBar style="dark" />
-    <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : undefined}>
-      <ScrollView contentContainerStyle={styles.page} keyboardShouldPersistTaps="handled">
-        <View style={styles.header}>
-          <View><Text style={styles.eyebrow}>A LITTLE PEACE OF MIND</Text><Text style={styles.title}>Blister Buddy</Text></View>
-          <View style={styles.avatar}><Text style={styles.avatarText}>✳</Text></View>
+  return (
+    // key: each screen starts scrolled to the top.
+    <ScrollView key={screen} contentContainerStyle={scrollContent} keyboardShouldPersistTaps="handled">
+      {screen === "account" && <AccountScreen user={user} account={account} pushToken={pushToken} onBack={home} />}
+      {screen === "password" && <PasswordForm pid={account.pid} hasPassword={passwordSet} onSaved={() => { setPasswordSet(true); home(); }} onBack={home} />}
+      {screen === "subscribe" && <SubscribeForm uid={uid} ownPid={account.pid} onBack={home} />}
+      {screen === "schedule" && <ScheduleWizard uid={uid} pid={account.pid} current={own} width={width} onBack={home} />}
+      {screen === "home" && <>
+        <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 8 }}>
+          <Text style={s.title}>Blister Buddy</Text>
+          <LanguageSwitch />
         </View>
-        <Text style={styles.intro}>Your daily pill, kept simple.</Text>
-
-        <View style={styles.idCard}>
-          <View style={styles.idHeader}><Text style={styles.cardLabel}>YOUR PERSONAL ID</Text><Text style={styles.lock}>● PRIVATE</Text></View>
-          <Text selectable style={styles.personalId}>{dashboard.personalId}</Text>
-          <Text style={styles.cardFoot}>Share this ID and your password with someone you trust.</Text>
+        <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+          <Text style={[s.muted, { flex: 1 }]} numberOfLines={1}>{user.email}</Text>
+          <LinkButton title={`${t.account} ›`} onPress={() => setScreen("account")} />
         </View>
 
-        {dashboard.own ? <View style={styles.card}>
-          <View style={styles.sectionTop}><View><Text style={styles.sectionTitle}>Your pill pack</Text><Text style={styles.muted}>Daily reminder · {dashboard.own.reminderTime}</Text></View><View style={[styles.status, dashboard.own.takenToday && styles.statusDone]}><Text style={[styles.statusText, dashboard.own.takenToday && styles.statusTextDone]}>{dashboard.own.takenToday ? "TAKEN TODAY" : "UP NEXT"}</Text></View></View>
-          <Blister count={dashboard.own.pillsPerPack} taken={dashboard.own.pillsTaken} />
-          <View style={styles.progressRow}><Text style={styles.progress}>{dashboard.own.pillsTaken} of {dashboard.own.pillsPerPack} pills in this pack</Text><Pressable onPress={() => setEditingSchedule(!editingSchedule)}><Text style={styles.link}>{editingSchedule ? "Close settings" : "Edit schedule"}</Text></Pressable></View>
-          {editingSchedule && <>
-            <Text style={styles.label}>PILLS IN A BLISTER</Text><Field value={pillCount} onChangeText={setPillCount} keyboardType="number-pad" />
-            <Text style={styles.label}>PILLS ALREADY TAKEN</Text><Field value={pillsTaken} onChangeText={setPillsTaken} keyboardType="number-pad" />
-            <Text style={styles.label}>DAILY REMINDER TIME · 24 HOUR</Text><Field value={reminderTime} onChangeText={setReminderTime} placeholder="20:00" />
-            <Pressable disabled={busy} style={styles.secondaryButton} onPress={createSchedule}><Text style={styles.secondaryText}>Save schedule changes</Text></Pressable>
-          </>}
-          <Pressable disabled={busy || dashboard.own.takenToday} style={[styles.primaryButton, dashboard.own.takenToday && styles.disabledButton]} onPress={markTaken}>
-            <Text style={styles.primaryText}>{dashboard.own.takenToday ? "Today's pill is marked taken" : "Mark today’s pill as taken"}</Text>
-          </Pressable>
-          <Text style={styles.hint}>Only your subscribers are notified when you mark it taken.</Text>
-        </View> : <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Create your schedule</Text><Text style={styles.muted}>Start with the pack in front of you.</Text>
-          <Text style={styles.label}>PILLS IN A BLISTER</Text><Field value={pillCount} onChangeText={setPillCount} keyboardType="number-pad" placeholder="21" />
-          <Text style={styles.label}>PILLS ALREADY TAKEN</Text><Field value={pillsTaken} onChangeText={setPillsTaken} keyboardType="number-pad" placeholder="0" />
-          <Text style={styles.label}>DAILY REMINDER TIME · 24 HOUR</Text><Field value={reminderTime} onChangeText={setReminderTime} placeholder="20:00" />
-          <Text style={styles.hint}>Your time zone is detected automatically. We’ll remind you and your subscribers when the pill is due.</Text>
-          <Blister count={previewCount(pillCount)} taken={previewTaken(pillsTaken, pillCount)} />
-          <Pressable disabled={busy || !dashboard.hasPassword} style={[styles.primaryButton, (!dashboard.hasPassword || busy) && styles.disabledButton]} onPress={createSchedule}><Text style={styles.primaryText}>{dashboard.hasPassword ? "Save my schedule" : "Set a password first"}</Text></Pressable>
-        </View>}
-
-        <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Your subscriber password</Text>
-          <Text style={styles.muted}>{dashboard.hasPassword ? "Change it any time. Existing subscribers keep access." : "Set a password so only people you choose can subscribe."}</Text>
-          <Field value={password} onChangeText={setPassword} placeholder="At least 6 characters" secureTextEntry />
-          <Pressable disabled={busy} style={styles.secondaryButton} onPress={setSchedulePassword}><Text style={styles.secondaryText}>{dashboard.hasPassword ? "Update password" : "Set password"}</Text></Pressable>
+        <View style={{ backgroundColor: C.primary, borderRadius: 22, padding: 20, marginTop: 4 }}>
+          <Text style={{ color: "#F9DCE7", fontSize: 13, fontWeight: "700", letterSpacing: 1 }}>{t.yourId}</Text>
+          <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 6 }}>
+            <Text selectable style={{ color: "#FFF", fontSize: 36, fontWeight: "800", letterSpacing: 4 }} testID="personal-id">{account.pid}</Text>
+            <Pressable onPress={() => Clipboard.setStringAsync(account.pid).then(() => notify(t.copied, t.copiedBody({ pid: account.pid })))}
+              style={{ backgroundColor: "#FFFFFF33", paddingHorizontal: 14, paddingVertical: 8, borderRadius: 12 }} accessibilityRole="button">
+              <Text style={{ color: "#FFF", fontWeight: "700" }}>{t.copy}</Text>
+            </Pressable>
+          </View>
+          <Text style={{ color: "#FBE8EF", marginTop: 8, fontSize: 13, lineHeight: 18 }}>
+            {passwordSet ? t.subscriberLine({ n: subscriberCount }) : t.noPasswordHint}
+          </Text>
         </View>
 
-        <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Subscribe to someone</Text><Text style={styles.muted}>Enter their personal ID and schedule password.</Text>
-          <Text style={styles.label}>PERSONAL ID</Text><Field value={targetId} onChangeText={setTargetId} placeholder="e.g. 4A1B2C3D4E" autoCapitalize="characters" />
-          <Text style={styles.label}>SCHEDULE PASSWORD</Text><Field value={targetPassword} onChangeText={setTargetPassword} placeholder="Their password" secureTextEntry />
-          <Pressable disabled={busy} style={styles.secondaryButton} onPress={subscribe}><Text style={styles.secondaryText}>Subscribe to schedule</Text></Pressable>
+        {!emailVerified && (
+          <Card style={{ backgroundColor: "#FFF8E8", borderColor: "#F3E1B5" }}>
+            <Text style={s.body}>{t.verifyBanner({ email: user.email ?? "" })}</Text>
+            <LinkButton title={t.verifyResend} onPress={() => resendVerification(user).then(() => notify(t.verifySent), (e) => notify(t.errorTitle, errorText(e)))} />
+          </Card>
+        )}
+        {push && <PushBanner status={push} t={t} onEnable={() => refreshPush(true)} />}
+
+        <Button title={t.followSchedule} onPress={() => setScreen("subscribe")} style={{ marginTop: 16 }} />
+        {/* Both of these concern your own schedule, so they sit together. */}
+        <View style={{ flexDirection: "row", gap: 10 }}>
+          <Button kind="secondary" title={schedule ? t.editSchedule : t.createSchedule} onPress={() => setScreen("schedule")} style={{ flex: 1 }} />
+          <Button kind="secondary" title={passwordSet ? t.changePassword : t.setPassword} onPress={() => setScreen("password")} style={{ flex: 1 }} />
         </View>
 
-        <View style={styles.subHeader}><Text style={styles.sectionTitle}>Following</Text><Text style={styles.counter}>{dashboard.subscribed.length}</Text></View>
-        {dashboard.subscribed.length ? dashboard.subscribed.map((item) => <View key={item.ownerUid} style={styles.followCard}>
-          <View style={styles.followTop}><View><Text style={styles.followTitle}>Pill schedule</Text><Text style={styles.muted}>ID · {item.personalId}</Text></View><View style={[styles.status, item.takenToday && styles.statusDone]}><Text style={[styles.statusText, item.takenToday && styles.statusTextDone]}>{item.takenToday ? "TAKEN" : "UP NEXT"}</Text></View></View>
-          <View style={styles.followBottom}><Text style={styles.progress}>{item.pillsTaken} of {item.pillsPerPack} pills · {item.reminderTime}</Text><Text style={styles.pillDot}>✳</Text></View>
-          <Blister count={item.pillsPerPack} taken={item.pillsTaken} compact />
-        </View>) : <View style={styles.empty}><Text style={styles.emptyIcon}>♡</Text><Text style={styles.emptyTitle}>Your circle starts here</Text><Text style={styles.muted}>Subscribe to a schedule to see its daily status.</Text></View>}
-        <Text style={styles.footer}>Small reminders. More peace of mind.</Text>
-      </ScrollView>
-    </KeyboardAvoidingView>
-    {busy && <View style={styles.busyOverlay}><ActivityIndicator color="#fff" /></View>}
-  </SafeAreaView>;
+        {schedule && (
+          <OwnSchedule schedule={schedule} width={width} t={t}
+            onTaken={async () => {
+              if (await confirm(t.markTakenTitle, t.markTakenBody, t.markTakenOk)) queued(markTaken(account.pid, schedule));
+            }}
+            onNewPack={() => queued(startNewPack(account.pid, schedule))} />
+        )}
+
+        {account.subs.length > 0 && <Text style={[s.h2, { marginTop: 26 }]}>{t.following}</Text>}
+        {account.subs.map((p) => (
+          <FollowedSchedule key={p} pid={p} profile={followed[p]} width={width} t={t}
+            onRemove={async () => {
+              const f = followed[p];
+              const name = (f && f !== "denied" && f.name) || p;
+              if (await confirm(t.unsubscribeTitle, t.unsubscribeBody({ name }), t.unsubscribe)) queued(unsubscribe(uid, p));
+            }} />
+        ))}
+      </>}
+    </ScrollView>
+  );
 }
 
-function Field(props: React.ComponentProps<typeof TextInput>) {
-  return <TextInput {...props} style={[styles.input, props.style]} placeholderTextColor="#A5A2AF" autoCapitalize={props.autoCapitalize ?? "none"} />;
+function PushBanner({ status, t, onEnable }: { status: PushStatus; t: Strings; onEnable: () => void }) {
+  if (status === "granted") return null;
+  const text = { default: t.pushDefault, denied: t.pushDenied, "needs-install": t.pushInstall, unsupported: t.pushUnsupported }[status];
+  return (
+    <Card style={{ backgroundColor: "#FFF8E8", borderColor: "#F3E1B5" }}>
+      <Text style={s.body}>{text}</Text>
+      {status === "default" && <Button title={t.pushEnable} onPress={onEnable} />}
+    </Card>
+  );
 }
-function Blister({ count, taken, compact = false }: { count: number; taken: number; compact?: boolean }) {
-  return <View style={[styles.blister, compact && styles.blisterCompact]}>
-    {Array.from({ length: count }, (_, i) => <View key={i} style={[styles.cell, compact && styles.cellCompact]}>
-      <View style={[styles.pill, compact && styles.pillCompact, i < taken && styles.pillTaken]}><Text style={[styles.pillGlyph, i < taken && styles.pillGlyphTaken]}>{i < taken ? "✓" : "✳"}</Text></View>
-    </View>)}
-  </View>;
-}
-function SetupScreen() {
-  return <SafeAreaView style={styles.safe}><StatusBar style="dark"/><View style={styles.setup}><Text style={styles.setupIcon}>✳</Text><Text style={styles.title}>One last setup step</Text><Text style={styles.setupBody}>Add your Firebase settings and deployed API URL to <Text style={{fontWeight:"700"}}>.env</Text>, then restart Expo. See README for setup steps.</Text></View></SafeAreaView>;
-}
-function previewCount(value: string) { const parsed = Number(value); return Math.max(1, Math.min(42, Number.isInteger(parsed) ? parsed : 21)); }
-function previewTaken(value: string, pack: string) { const parsed = Number(value); return Math.max(0, Math.min(previewCount(pack), Number.isInteger(parsed) ? parsed : 0)); }
-function errorText(error: unknown) { return error instanceof Error ? error.message.replace(/^Firebase: /, "") : "Please check your connection and try again."; }
 
-const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: "#F6F5FA" }, page: { paddingHorizontal: 20, paddingTop: 18, paddingBottom: 44, maxWidth: 600, width: "100%", alignSelf: "center" },
-  header: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" }, eyebrow: { fontSize: 9, letterSpacing: 2, color: "#77728B", fontWeight: "800", marginBottom: 7 }, title: { fontSize: 29, color: "#252238", fontWeight: "800", letterSpacing: -1 }, avatar: { width: 42, height: 42, borderRadius: 15, backgroundColor: "#E8E4FA", alignItems: "center", justifyContent: "center" }, avatarText: { fontSize: 23, color: "#6558C8" }, intro: { color: "#777487", fontSize: 14, marginTop: 7, marginBottom: 21 },
-  idCard: { backgroundColor: "#6457C8", borderRadius: 21, padding: 19, marginBottom: 15 }, idHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" }, cardLabel: { color: "#DCD8FA", fontSize: 9, letterSpacing: 1.4, fontWeight: "800" }, lock: { color: "#DCD8FA", fontSize: 9, fontWeight: "700" }, personalId: { color: "#FFF", fontSize: 26, fontWeight: "800", letterSpacing: 3, marginTop: 12 }, cardFoot: { color: "#E2DEFF", fontSize: 11, lineHeight: 17, marginTop: 9 },
-  card: { backgroundColor: "#FFF", borderRadius: 20, padding: 18, marginBottom: 13, borderWidth: 1, borderColor: "#EFEDF4" }, sectionTop: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" }, sectionTitle: { fontSize: 17, fontWeight: "800", color: "#29263B" }, muted: { color: "#858292", fontSize: 12, lineHeight: 18, marginTop: 4 }, status: { borderRadius: 20, backgroundColor: "#F1EFF8", paddingHorizontal: 9, paddingVertical: 6 }, statusDone: { backgroundColor: "#E5F4ED" }, statusText: { color: "#6F6888", fontSize: 8, fontWeight: "800", letterSpacing: .6 }, statusTextDone: { color: "#2D8A61" },
-  blister: { flexDirection: "row", flexWrap: "wrap", backgroundColor: "#F1F0F5", borderRadius: 16, padding: 10, marginTop: 17 }, blisterCompact: { marginTop: 12, padding: 6 }, cell: { width: "20%", padding: 5, alignItems: "center" }, cellCompact: { width: "16.66%", padding: 3 }, pill: { width: 39, height: 39, borderRadius: 14, backgroundColor: "#FFF", borderWidth: 1, borderColor: "#E1DDEA", alignItems: "center", justifyContent: "center", shadowColor: "#2A2540", shadowOpacity: .05, shadowRadius: 3, shadowOffset: {width:0,height:2} }, pillCompact: { width: 29, height: 29, borderRadius: 10 }, pillTaken: { backgroundColor: "#DFF1E8", borderColor: "#B8DEC9" }, pillGlyph: { color: "#A39BBF", fontSize: 15 }, pillGlyphTaken: { color: "#31815E", fontWeight: "800" },
-  progressRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: 13 }, progress: { fontSize: 11, color: "#716D7D", fontWeight: "600" }, link: { fontSize: 11, color: "#6558C8", fontWeight: "700" }, primaryButton: { backgroundColor: "#6457C8", borderRadius: 14, minHeight: 49, alignItems: "center", justifyContent: "center", marginTop: 16, paddingHorizontal: 15 }, primaryText: { color: "#FFF", fontSize: 13, fontWeight: "800" }, disabledButton: { opacity: .48 }, hint: { color: "#9693A1", fontSize: 10, lineHeight: 16, marginTop: 9 }, label: { fontSize: 9, letterSpacing: 1, fontWeight: "800", color: "#777386", marginTop: 18, marginBottom: 7 }, input: { height: 47, borderRadius: 12, borderWidth: 1, borderColor: "#E9E6F0", backgroundColor: "#FCFBFD", paddingHorizontal: 13, fontSize: 14, color: "#302D42" }, secondaryButton: { minHeight: 46, borderRadius: 13, borderColor: "#D9D4F0", borderWidth: 1, alignItems: "center", justifyContent: "center", marginTop: 14, backgroundColor: "#FAF9FD" }, secondaryText: { color: "#5D51B5", fontWeight: "800", fontSize: 12 },
-  subHeader: { flexDirection: "row", alignItems: "center", marginTop: 8, marginBottom: 10, gap: 9 }, counter: { color: "#6256C7", fontSize: 11, fontWeight: "800", backgroundColor: "#EAE7FA", paddingHorizontal: 8, paddingVertical: 4, borderRadius: 10 }, followCard: { backgroundColor: "#FFF", borderWidth: 1, borderColor: "#EFEDF4", borderRadius: 18, padding: 15, marginBottom: 10 }, followTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" }, followTitle: { color: "#302D42", fontWeight: "800", fontSize: 14 }, followBottom: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 12 }, pillDot: { color: "#9389D6", fontSize: 16 }, empty: { backgroundColor: "#F0EEF6", borderRadius: 18, padding: 23, alignItems: "center" }, emptyIcon: { color: "#8E84D5", fontSize: 25, marginBottom: 7 }, emptyTitle: { color: "#39354C", fontWeight: "800", fontSize: 14, marginBottom: 2 }, footer: { textAlign: "center", color: "#A09DAB", fontSize: 10, marginTop: 20 },
-  loading: { flex: 1, backgroundColor: "#F6F5FA", alignItems: "center", justifyContent: "center", gap: 12 }, busyOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: "#211D3780", alignItems: "center", justifyContent: "center" }, setup: { flex: 1, alignItems: "center", justifyContent: "center", padding: 32 }, setupIcon: { color: "#6558C8", fontSize: 40, marginBottom: 18 }, setupBody: { textAlign: "center", color: "#777487", lineHeight: 23, marginTop: 15, fontSize: 14 },
-});
+function StatusPill({ sch, t }: { sch: Schedule; t: Strings }) {
+  const done = takenToday(sch) || packFinished(sch);
+  const label = takenToday(sch) ? t.takenToday : packFinished(sch) ? t.packFinished : t.dueAt({ time: sch.time });
+  return (
+    <View style={{ alignSelf: "flex-start", backgroundColor: done ? C.successSoft : C.primarySoft, borderRadius: 12, paddingHorizontal: 10, paddingVertical: 4, marginTop: 6 }}>
+      <Text style={{ color: done ? C.success : C.primaryDark, fontWeight: "700", fontSize: 13 }}>{label}</Text>
+    </View>
+  );
+}
+
+function PackView({ sch, width }: { sch: Schedule; width: number }) {
+  const done = takenToday(sch);
+  return (
+    <View style={{ alignItems: "center", marginTop: 14 }}>
+      <Blister count={sch.pillsPerPack} taken={sch.taken} width={width}
+        showNext={!done && !packFinished(sch)} startWeekday={packStartWeekday(sch.taken, done)} />
+    </View>
+  );
+}
+
+function OwnSchedule({ schedule, width, t, onTaken, onNewPack }: {
+  schedule: Schedule; width: number; t: Strings; onTaken: () => void; onNewPack: () => void;
+}) {
+  const done = takenToday(schedule);
+  return (
+    <Card style={{ marginTop: 22 }}>
+      <Text style={s.h2}>{t.myPack}</Text>
+      <StatusPill sch={schedule} t={t} />
+      <PackView sch={schedule} width={Math.min(width - 72, 420)} />
+      <Text style={[s.muted, { textAlign: "center", marginTop: 8 }]}>
+        {t.ownProgress({ taken: schedule.taken, total: schedule.pillsPerPack, time: schedule.time })}
+      </Text>
+      {packFinished(schedule)
+        ? <Button title={t.newPack} onPress={onNewPack} />
+        : <Button title={done ? t.alreadyTaken : t.markTaken} onPress={onTaken} disabled={done} />}
+    </Card>
+  );
+}
+
+function FollowedSchedule({ pid, profile, width, t, onRemove }: { pid: string; profile: Followed; width: number; t: Strings; onRemove: () => void }) {
+  const sch = profile && profile !== "denied" && hasSchedule(profile) ? profile : null;
+  return (
+    <Card>
+      <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start" }}>
+        <View style={{ flex: 1 }}>
+          <Text style={s.h2}>{sch?.name || pid}</Text>
+          {sch?.name ? <Text style={s.muted}>{pid}</Text> : null}
+          {sch && <StatusPill sch={sch} t={t} />}
+        </View>
+        <Pressable onPress={onRemove} hitSlop={10} accessibilityRole="button"><Text style={{ color: C.muted, fontWeight: "600" }}>{t.unsubscribe}</Text></Pressable>
+      </View>
+      {profile === undefined && <ActivityIndicator color={C.primary} style={{ marginTop: 12 }} />}
+      {profile === "denied" && <Text style={[s.muted, { marginTop: 8 }]}>{t.noLongerAvailable}</Text>}
+      {profile && profile !== "denied" && !sch && <Text style={[s.muted, { marginTop: 8 }]}>{t.noScheduleYet}</Text>}
+      {sch && (
+        <>
+          <PackView sch={sch} width={Math.min(width - 72, 360)} />
+          <Text style={[s.muted, { textAlign: "center", marginTop: 8 }]}>{t.progress({ taken: sch.taken, total: sch.pillsPerPack })}</Text>
+        </>
+      )}
+    </Card>
+  );
+}

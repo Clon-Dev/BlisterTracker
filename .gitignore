@@ -1,9 +1,7 @@
 node_modules/
 .expo/
+.firebase/
 dist/
-web-build/
-functions/node_modules/
-functions/lib/
 worker/.wrangler/
 worker/.dev.vars
 service-account*.json

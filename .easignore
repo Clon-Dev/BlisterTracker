@@ -1,0 +1,11 @@
+# Like .gitignore, but uploads google-services.json and .env (public client config) to EAS Build.
+node_modules/
+.expo/
+dist/
+web-build/
+worker/
+scripts/
+service-account*.json
+firebase-debug.log
+GoogleService-Info.plist
+.claude/

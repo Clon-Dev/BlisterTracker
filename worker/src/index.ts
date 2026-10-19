@@ -1,290 +1,259 @@
-interface Env {
-  DB: D1Database;
+// Blister Buddy notifier: a cron-only Cloudflare Worker (no HTTP endpoint).
+// Every minute it
+//   1. sends due daily reminders (users/{pid}.nextReminderAt <= now) to the owner and subscribers,
+//   2. tells subscribers when a pill was marked taken (users/{pid}.takenPending == true).
+// Data lives in Firestore (Firebase Spark plan); pushes go out via the FCM HTTP v1 API.
+
+export interface Env {
   FIREBASE_PROJECT_ID: string;
-  FIREBASE_API_KEY: string;
-  FCM_SERVICE_ACCOUNT_JSON: string;
-  PASSWORD_PEPPER: string;
+  APP_URL: string;
+  SERVICE_ACCOUNT_JSON: string;
 }
 
-interface ScheduleRow {
-  owner_uid: string;
-  pills_per_pack: number;
-  pills_taken: number;
-  reminder_time: string;
-  timezone: string;
-  last_taken_date: string | null;
-  last_reminder_date: string | null;
-}
-interface UserRow { uid: string; personal_id: string; password_salt: string | null; password_hash: string | null }
-interface ServiceAccount { client_email: string; private_key: string }
-
-const headers = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Authorization, Content-Type",
-  "Content-Type": "application/json; charset=utf-8",
+type Value = {
+  stringValue?: string; integerValue?: string; booleanValue?: boolean; timestampValue?: string;
+  nullValue?: null; arrayValue?: { values?: Value[] };
 };
-const encoder = new TextEncoder();
-let cachedGoogleToken: { token: string; expiresAt: number } | undefined;
+type Doc = { name: string; fields?: Record<string, Value>; updateTime: string };
 
-class ApiError extends Error {
-  constructor(public status: number, message: string) { super(message); }
-}
+const MAX_LATE_MS = 6 * 60 * 60 * 1000; // after an outage, skip reminders older than this
 
-function json(data: unknown, status = 200) {
-  return new Response(JSON.stringify(data), { status, headers });
-}
-function localParts(date: Date, timeZone: string) {
-  const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone, year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", hourCycle: "h23",
-  }).formatToParts(date);
-  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-  return { date: `${values.year}-${values.month}-${values.day}`, time: `${values.hour}:${values.minute}` };
-}
-function randomSalt() {
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  return bytesToBase64Url(bytes);
-}
-function bytesToBase64Url(bytes: Uint8Array) {
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
-}
-function base64Url(value: string) { return bytesToBase64Url(encoder.encode(value)); }
+// ---------- Google auth (service account → OAuth access token) ----------
 
-async function passwordHash(password: string, salt: string, pepper: string) {
-  const key = await crypto.subtle.importKey("raw", encoder.encode(pepper), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const digest = await crypto.subtle.sign("HMAC", key, encoder.encode(`${salt}:${password}`));
-  return bytesToBase64Url(new Uint8Array(digest));
-}
-async function personalId(uid: string) {
-  const digest = await crypto.subtle.digest("SHA-256", encoder.encode(uid));
-  return Array.from(new Uint8Array(digest)).slice(0, 5).map((n) => n.toString(16).padStart(2, "0")).join("").toUpperCase();
-}
+let cachedToken: { token: string; expires: number } | null = null;
 
-async function authenticatedUid(request: Request, env: Env) {
-  const match = request.headers.get("Authorization")?.match(/^Bearer (.+)$/);
-  if (!match) throw new ApiError(401, "Sign in to continue.");
-  const response = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(env.FIREBASE_API_KEY)}`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ idToken: match[1] }),
+const b64url = (data: ArrayBuffer | string) => {
+  const bytes = typeof data === "string" ? new TextEncoder().encode(data) : new Uint8Array(data);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+};
+
+async function accessToken(env: Env) {
+  if (cachedToken && cachedToken.expires > Date.now() + 60_000) return cachedToken.token;
+  const sa = JSON.parse(env.SERVICE_ACCOUNT_JSON) as { client_email: string; private_key: string };
+  const pem = sa.private_key.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
+  const key = await crypto.subtle.importKey("pkcs8", Uint8Array.from(atob(pem), (c) => c.charCodeAt(0)),
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
+  const now = Math.floor(Date.now() / 1000);
+  const unsigned = `${b64url(JSON.stringify({ alg: "RS256", typ: "JWT" }))}.${b64url(JSON.stringify({
+    iss: sa.client_email,
+    scope: "https://www.googleapis.com/auth/datastore https://www.googleapis.com/auth/firebase.messaging",
+    aud: "https://oauth2.googleapis.com/token", iat: now, exp: now + 3600,
+  }))}`;
+  const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, new TextEncoder().encode(unsigned));
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion: `${unsigned}.${b64url(signature)}` }),
   });
-  if (!response.ok) throw new ApiError(401, "Your sign-in expired. Please reopen the app.");
-  const result = await response.json() as { users?: Array<{ localId?: string }> };
-  const uid = result.users?.[0]?.localId;
-  if (!uid) throw new ApiError(401, "Your sign-in could not be verified.");
-  return uid;
+  if (!res.ok) throw new Error(`OAuth token request failed: ${res.status} ${await res.text()}`);
+  const json = await res.json() as { access_token: string; expires_in: number };
+  cachedToken = { token: json.access_token, expires: Date.now() + json.expires_in * 1000 };
+  return cachedToken.token;
 }
 
-async function bodyOf(request: Request): Promise<Record<string, unknown>> {
-  try {
-    const body = await request.json();
-    if (body && typeof body === "object" && !Array.isArray(body)) return body as Record<string, unknown>;
-  } catch { /* handled below */ }
-  throw new ApiError(400, "Send a JSON request body.");
-}
-function assert(condition: unknown, message: string): asserts condition {
-  if (!condition) throw new ApiError(400, message);
-}
+// ---------- Firestore REST ----------
 
-async function ensureProfile(uid: string, env: Env) {
-  const id = await personalId(uid);
-  await env.DB.prepare("INSERT OR IGNORE INTO users (uid, personal_id, created_at) VALUES (?, ?, ?)")
-    .bind(uid, id, new Date().toISOString()).run();
-  const user = await env.DB.prepare("SELECT * FROM users WHERE uid = ?").bind(uid).first<UserRow>();
-  if (!user) throw new Error("Could not create the user profile.");
-  return user;
-}
+class Firestore {
+  private env: Env;
+  readonly token: string;
+  constructor(env: Env, token: string) { this.env = env; this.token = token; }
+  get root() { return `projects/${this.env.FIREBASE_PROJECT_ID}/databases/(default)/documents`; }
 
-async function googleAccessToken(env: Env) {
-  if (cachedGoogleToken && cachedGoogleToken.expiresAt > Date.now() + 60_000) return cachedGoogleToken.token;
-  let service: ServiceAccount;
-  try { service = JSON.parse(env.FCM_SERVICE_ACCOUNT_JSON) as ServiceAccount; }
-  catch { throw new Error("FCM service account secret is not valid JSON."); }
-  const issued = Math.floor(Date.now() / 1000);
-  const assertionHeader = base64Url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
-  const assertionPayload = base64Url(JSON.stringify({
-    iss: service.client_email, sub: service.client_email,
-    aud: "https://oauth2.googleapis.com/token", iat: issued, exp: issued + 3600,
-    scope: "https://www.googleapis.com/auth/firebase.messaging",
-  }));
-  const unsigned = `${assertionHeader}.${assertionPayload}`;
-  const pem = service.private_key.replace(/-----BEGIN PRIVATE KEY-----|-----END PRIVATE KEY-----|\s/g, "");
-  const binary = atob(pem);
-  const der = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-  const key = await crypto.subtle.importKey("pkcs8", der, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
-  const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, encoder.encode(unsigned));
-  const assertion = `${unsigned}.${bytesToBase64Url(new Uint8Array(signature))}`;
-  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion }),
-  });
-  if (!tokenResponse.ok) throw new Error("Google rejected the FCM service account credentials.");
-  const token = await tokenResponse.json() as { access_token: string; expires_in: number };
-  cachedGoogleToken = { token: token.access_token, expiresAt: Date.now() + token.expires_in * 1000 };
-  return token.access_token;
-}
-
-async function notify(env: Env, uids: string[], title: string, messageBody: string, data: Record<string, string>) {
-  const distinct = [...new Set(uids)];
-  if (!distinct.length) return;
-  const placeholders = distinct.map(() => "?").join(",");
-  const query = await env.DB.prepare(`SELECT token_hash, token FROM devices WHERE uid IN (${placeholders})`).bind(...distinct).all<{token_hash: string; token: string}>();
-  const devices = query.results ?? [];
-  if (!devices.length) return;
-  const accessToken = await googleAccessToken(env);
-  await Promise.all(devices.map(async (device) => {
-    const response = await fetch(`https://fcm.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/messages:send`, {
-      method: "POST", headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ message: { token: device.token, notification: { title, body: messageBody }, data } }),
+  async call<T>(path: string, init: RequestInit = {}): Promise<{ ok: boolean; status: number; body: T }> {
+    const res = await fetch(`https://firestore.googleapis.com/v1/${path}`, {
+      ...init, headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },
     });
-    if (!response.ok) {
-      const details = await response.json().catch(() => null) as { error?: { details?: Array<{ errorCode?: string }> } } | null;
-      const code = details?.error?.details?.[0]?.errorCode;
-      if (code === "UNREGISTERED" || response.status === 404) {
-        await env.DB.prepare("DELETE FROM devices WHERE token_hash = ?").bind(device.token_hash).run();
-      } else {
-        console.error("FCM send failed", response.status, code ?? "unknown");
-      }
+    return { ok: res.ok, status: res.status, body: await res.json() as T };
+  }
+
+  async query(field: string, op: string, value: Value): Promise<Doc[]> {
+    const r = await this.call<{ document?: Doc }[]>(`${this.root}:runQuery`, {
+      method: "POST",
+      body: JSON.stringify({ structuredQuery: {
+        from: [{ collectionId: "users" }],
+        where: { fieldFilter: { field: { fieldPath: field }, op, value } },
+        limit: 100,
+      } }),
+    });
+    if (!r.ok) throw new Error(`runQuery ${field} failed: ${r.status} ${JSON.stringify(r.body)}`);
+    return r.body.flatMap((x) => (x.document ? [x.document] : []));
+  }
+
+  async subscriberUids(pid: string): Promise<string[]> {
+    const r = await this.call<{ documents?: Doc[] }>(`${this.root}/users/${pid}/subscribers?pageSize=100`);
+    return (r.body.documents ?? []).map(pidOf);
+  }
+
+  /** Push targets (FCM token + notification language) of the given accounts. */
+  async devices(uids: string[]): Promise<{ uid: string; token: string; lang: Lang }[]> {
+    if (!uids.length) return [];
+    const r = await this.call<{ found?: Doc }[]>(`${this.root}:batchGet`, {
+      method: "POST", body: JSON.stringify({ documents: uids.map((u) => `${this.root}/accounts/${u}`) }),
+    });
+    return r.body.flatMap((x) => {
+      if (!x.found) return [];
+      const uid = pidOf(x.found);
+      const lang: Lang = str(x.found, "lang") === "de" ? "de" : "en";
+      return (x.found.fields?.tokens?.arrayValue?.values ?? []).map((v) => ({ uid, token: v.stringValue!, lang }));
+    });
+  }
+
+  /** Updates fields only if the doc hasn't changed since we read it; false if the owner edited it meanwhile. */
+  async patchIfUnchanged(doc: Doc, fields: Record<string, Value>) {
+    const params = new URLSearchParams({ "currentDocument.updateTime": doc.updateTime });
+    for (const f of Object.keys(fields)) params.append("updateMask.fieldPaths", f);
+    const r = await this.call(`${doc.name}?${params}`, { method: "PATCH", body: JSON.stringify({ fields }) });
+    return r.ok;
+  }
+
+  async removeToken(uid: string, token: string) {
+    await this.call(`${this.root}:commit`, {
+      method: "POST",
+      body: JSON.stringify({ writes: [{ transform: {
+        document: `${this.root}/accounts/${uid}`,
+        fieldTransforms: [{ fieldPath: "tokens", removeAllFromArray: { values: [{ stringValue: token }] } }],
+      } }] }),
+    });
+  }
+}
+
+const str = (d: Doc, f: string) => d.fields?.[f]?.stringValue ?? "";
+const int = (d: Doc, f: string) => Number(d.fields?.[f]?.integerValue ?? 0);
+/** Last path segment of a doc name: the pid for users/{pid}, the uid for accounts/{uid}. */
+const pidOf = (d: Doc) => d.name.split("/").pop()!;
+const ts = (ms: number | null): Value => (ms === null ? { nullValue: null } : { timestampValue: new Date(ms).toISOString() });
+
+// ---------- Time zones (no libraries in Workers; Intl does the work) ----------
+
+function zonedParts(at: number, tz: string) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", {
+    timeZone: tz, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  }).formatToParts(new Date(at)).map((p) => [p.type, Number(p.value)]));
+  return parts as Record<"year" | "month" | "day" | "hour" | "minute" | "second", number>;
+}
+
+const dayKey = (at: number, tz: string) => {
+  const p = zonedParts(at, tz);
+  return `${p.year}-${String(p.month).padStart(2, "0")}-${String(p.day).padStart(2, "0")}`;
+};
+
+/** UTC ms for a wall-clock time in tz (day may overflow; Date.UTC normalizes it). */
+function zonedToUtc(year: number, month: number, day: number, hour: number, minute: number, tz: string) {
+  const guess = Date.UTC(year, month - 1, day, hour, minute);
+  const offset = (at: number) => {
+    const p = zonedParts(at, tz);
+    return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - Math.floor(at / 1000) * 1000;
+  };
+  const first = guess - offset(guess);
+  return guess - offset(first); // second pass settles DST boundaries
+}
+
+/** First occurrence of "HH:MM" in tz strictly after `after`. */
+export function nextOccurrence(time: string, tz: string, after: number) {
+  const [h, m] = time.split(":").map(Number);
+  const p = zonedParts(after, tz);
+  for (let k = 0; k < 3; k++) {
+    const t = zonedToUtc(p.year, p.month, p.day + k, h, m, tz);
+    if (t > after) return t;
+  }
+  return after + 24 * 3600 * 1000;
+}
+
+// ---------- FCM ----------
+
+type Lang = "en" | "de";
+type Text = { title: string; body: string };
+const TEXT = {
+  en: {
+    ownerReminder: (): Text => ({ title: "💊 Pill time", body: "Time to take today’s pill." }),
+    subscriberReminder: (name: string): Text => ({ title: "💊 Pill time", body: `${name} should take today’s pill now.` }),
+    taken: (name: string, taken: number, total: number): Text => ({ title: "✅ Pill taken", body: `${name} took today’s pill (${taken}/${total}).` }),
+  },
+  de: {
+    ownerReminder: (): Text => ({ title: "💊 Pillenzeit", body: "Zeit für die heutige Pille." }),
+    subscriberReminder: (name: string): Text => ({ title: "💊 Pillenzeit", body: `${name} sollte jetzt die heutige Pille nehmen.` }),
+    taken: (name: string, taken: number, total: number): Text => ({ title: "✅ Pille genommen", body: `${name} hat die heutige Pille genommen (${taken}/${total}).` }),
+  },
+} satisfies Record<Lang, unknown>;
+type Texts = (typeof TEXT)["en"];
+
+/** Sends to every device of the given accounts, each in its account's language. Returns the number delivered. */
+async function sendAll(env: Env, fs: Firestore, uids: string[], text: (t: Texts) => Text, tag: string) {
+  const targets = await fs.devices(uids);
+  let sent = 0;
+  await Promise.all(targets.map(async ({ uid, token, lang }) => {
+    const res = await fetch(`https://fcm.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/messages:send`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${fs.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ message: {
+        token,
+        notification: text(TEXT[lang]),
+        data: { tag },
+        android: { priority: "HIGH", notification: { channel_id: "default", tag } },
+        webpush: { headers: { Urgency: "high" }, fcm_options: { link: env.APP_URL } },
+      } }),
+    });
+    if (res.ok) { sent++; return; }
+    const body = await res.text();
+    if (res.status === 404 || body.includes("UNREGISTERED") || body.includes("registration token is not a valid")) {
+      await fs.removeToken(uid, token); // app uninstalled or token rotated
+    } else {
+      console.error(`FCM send failed (${res.status}): ${body}`);
     }
   }));
+  return sent;
 }
 
-async function subscribeToSchedule(uid: string, data: Record<string, unknown>, env: Env) {
-  const targetId = String(data.personalId ?? "").trim().toUpperCase();
-  const password = String(data.password ?? "");
-  assert(/^[A-F0-9]{10}$/.test(targetId) && password.length >= 6 && password.length <= 72, "Enter a valid personal ID and password.");
-  const target = await env.DB.prepare("SELECT * FROM users WHERE personal_id = ?").bind(targetId).first<UserRow>();
-  if (!target) throw new ApiError(404, "That personal ID was not found.");
-  if (target.uid === uid) throw new ApiError(400, "You cannot subscribe to your own schedule.");
-  if (!target.password_hash || !target.password_salt) throw new ApiError(403, "The ID or password is incorrect.");
-  const match = await passwordHash(password, target.password_salt, env.PASSWORD_PEPPER);
-  if (match !== target.password_hash) throw new ApiError(403, "The ID or password is incorrect.");
-  const schedule = await env.DB.prepare("SELECT owner_uid FROM schedules WHERE owner_uid = ?").bind(target.uid).first();
-  if (!schedule) throw new ApiError(404, "This user has not created a schedule yet.");
-  await env.DB.prepare("INSERT OR IGNORE INTO subscriptions (subscriber_uid, owner_uid, created_at) VALUES (?, ?, ?)")
-    .bind(uid, target.uid, new Date().toISOString()).run();
-  return { ok: true };
+// ---------- Jobs ----------
+
+/** Processes docs one by one; a failure is logged and doesn't stop the others. */
+async function forEachDoc(job: string, docs: Doc[], fn: (doc: Doc, pid: string) => Promise<void>) {
+  for (const doc of docs) {
+    const pid = pidOf(doc);
+    try { await fn(doc, pid); } catch (e) { console.error(`${job} ${pid} failed:`, e); }
+  }
 }
 
-async function dashboard(uid: string, env: Env) {
-  const user = await ensureProfile(uid, env);
-  const own = await env.DB.prepare("SELECT * FROM schedules WHERE owner_uid = ?").bind(uid).first<ScheduleRow>();
-  const following = await env.DB.prepare(`
-    SELECT s.*, u.personal_id FROM subscriptions sub
-    JOIN schedules s ON s.owner_uid = sub.owner_uid
-    JOIN users u ON u.uid = s.owner_uid
-    WHERE sub.subscriber_uid = ? ORDER BY sub.created_at
-  `).bind(uid).all<ScheduleRow & {personal_id: string}>();
-  const today = new Date();
-  const ownResult = own ? { pillsPerPack: own.pills_per_pack, pillsTaken: own.pills_taken,
-    reminderTime: own.reminder_time, takenToday: own.last_taken_date === localParts(today, own.timezone).date } : null;
-  const subscribed = (following.results ?? []).map((item) => ({ ownerUid: item.owner_uid, personalId: item.personal_id,
-    pillsPerPack: item.pills_per_pack, pillsTaken: item.pills_taken, reminderTime: item.reminder_time,
-    takenToday: item.last_taken_date === localParts(today, item.timezone).date }));
-  return { personalId: user.personal_id, hasPassword: Boolean(user.password_hash), own: ownResult, subscribed };
+async function sendReminders(env: Env, fs: Firestore, now: number) {
+  const due = await fs.query("nextReminderAt", "LESS_THAN_OR_EQUAL", ts(now));
+  await forEachDoc("reminder", due, async (doc, pid) => {
+    const tz = str(doc, "tz");
+    const dueAt = Date.parse(doc.fields!.nextReminderAt.timestampValue!);
+    const finished = int(doc, "taken") >= int(doc, "pillsPerPack");
+    const alreadyTaken = str(doc, "lastTakenDay") === dayKey(dueAt, tz);
+
+    // Claim the reminder first so a failure can never cause duplicate notifications.
+    const next = finished ? null : nextOccurrence(str(doc, "time"), tz, now);
+    if (!(await fs.patchIfUnchanged(doc, { nextReminderAt: ts(next) }))) return;
+    if (finished || alreadyTaken || now - dueAt > MAX_LATE_MS) return;
+
+    const name = str(doc, "name") || pid;
+    const subs = await fs.subscriberUids(pid);
+    const a = await sendAll(env, fs, [str(doc, "ownerUid")], (t) => t.ownerReminder(), `reminder-${pid}`);
+    const b = await sendAll(env, fs, subs, (t) => t.subscriberReminder(name), `reminder-${pid}`);
+    console.log(`reminder ${pid}: ${a + b} notifications`);
+  });
 }
 
-async function route(name: string, uid: string, data: Record<string, unknown>, env: Env): Promise<unknown> {
-  if (name === "ensureProfile") {
-    const user = await ensureProfile(uid, env);
-    return { personalId: user.personal_id, hasSchedule: Boolean(await env.DB.prepare("SELECT 1 FROM schedules WHERE owner_uid = ?").bind(uid).first()) };
-  }
-  if (name === "setSchedulePassword") {
-    const password = String(data.password ?? "");
-    assert(password.length >= 6 && password.length <= 72, "Use a password from 6 to 72 characters.");
-    const salt = randomSalt();
-    const hash = await passwordHash(password, salt, env.PASSWORD_PEPPER);
-    await env.DB.prepare("UPDATE users SET password_salt = ?, password_hash = ? WHERE uid = ?").bind(salt, hash, uid).run();
-    return { ok: true };
-  }
-  if (name === "createSchedule") {
-    const pills = Number(data.pillsPerPack);
-    const taken = Number(data.pillsTaken);
-    const time = String(data.reminderTime ?? "");
-    const timezone = String(data.timezone ?? "UTC");
-    assert(Number.isInteger(pills) && pills >= 1 && pills <= 42, "Choose between 1 and 42 pills per pack.");
-    assert(Number.isInteger(taken) && taken >= 0 && taken <= pills, "Taken pills must fit in the pack.");
-    assert(/^([01]\d|2[0-3]):[0-5]\d$/.test(time), "Choose a valid reminder time.");
-    try { new Intl.DateTimeFormat("en", { timeZone: timezone }); }
-    catch { throw new ApiError(400, "Choose a valid time zone."); }
-    const user = await env.DB.prepare("SELECT password_hash FROM users WHERE uid = ?").bind(uid).first<{password_hash: string | null}>();
-    if (!user?.password_hash) throw new ApiError(412, "Set a subscriber password first.");
-    const now = new Date().toISOString();
-    await env.DB.prepare(`
-      INSERT INTO schedules (owner_uid, pills_per_pack, pills_taken, reminder_time, timezone, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(owner_uid) DO UPDATE SET pills_per_pack=excluded.pills_per_pack,
-        pills_taken=excluded.pills_taken, reminder_time=excluded.reminder_time,
-        timezone=excluded.timezone, updated_at=excluded.updated_at
-    `).bind(uid, pills, taken, time, timezone, now, now).run();
-    return { ok: true };
-  }
-  if (name === "subscribeToSchedule") return subscribeToSchedule(uid, data, env);
-  if (name === "getDashboard") return dashboard(uid, env);
-  if (name === "registerDevice") {
-    const token = String(data.token ?? "");
-    assert(token.length >= 20 && token.length < 5000, "Invalid push notification token.");
-    const digest = await crypto.subtle.digest("SHA-256", encoder.encode(token));
-    const tokenHash = bytesToBase64Url(new Uint8Array(digest));
-    await env.DB.prepare(`INSERT INTO devices (token_hash, uid, token, updated_at) VALUES (?, ?, ?, ?)
-      ON CONFLICT(token_hash) DO UPDATE SET uid=excluded.uid, token=excluded.token, updated_at=excluded.updated_at`)
-      .bind(tokenHash, uid, token, new Date().toISOString()).run();
-    return { ok: true };
-  }
-  if (name === "markPillTaken") {
-    const now = new Date();
-    const schedule = await env.DB.prepare("SELECT timezone FROM schedules WHERE owner_uid = ?").bind(uid).first<{timezone: string}>();
-    if (!schedule) throw new ApiError(404, "Create a schedule first.");
-    const today = localParts(now, schedule.timezone).date;
-    const existing = await env.DB.prepare(`UPDATE schedules SET
-      last_taken_date=?, pills_taken=MIN(pills_taken+1, pills_per_pack), updated_at=?
-      WHERE owner_uid=? AND COALESCE(last_taken_date, '')<>? RETURNING pills_taken, pills_per_pack`)
-      .bind(today, now.toISOString(), uid, today)
-      .first<{pills_taken: number; pills_per_pack: number}>();
-    if (!existing) {
-      const current = await env.DB.prepare("SELECT last_taken_date FROM schedules WHERE owner_uid = ?").bind(uid).first<{last_taken_date: string | null}>();
-      if (current?.last_taken_date === today) throw new ApiError(409, "Today’s pill is already marked as taken.");
-      throw new Error("Could not mark today's pill as taken.");
-    }
-    const subs = await env.DB.prepare("SELECT subscriber_uid FROM subscriptions WHERE owner_uid = ?").bind(uid).all<{subscriber_uid: string}>();
-    await notify(env, (subs.results ?? []).map((row) => row.subscriber_uid), "Pill taken", "Today’s pill has been marked as taken.", { type: "taken", ownerId: uid });
-    return { ok: true, pillsTaken: existing.pills_taken, pillsPerPack: existing.pills_per_pack };
-  }
-  throw new ApiError(404, "Unknown app action.");
+async function sendTakenUpdates(env: Env, fs: Firestore) {
+  const pending = await fs.query("takenPending", "EQUAL", { booleanValue: true });
+  await forEachDoc("taken", pending, async (doc, pid) => {
+    if (!(await fs.patchIfUnchanged(doc, { takenPending: { booleanValue: false } }))) return;
+    const name = str(doc, "name") || pid;
+    const subs = await fs.subscriberUids(pid);
+    const sent = await sendAll(env, fs, subs, (t) => t.taken(name, int(doc, "taken"), int(doc, "pillsPerPack")), `taken-${pid}`);
+    console.log(`taken ${pid}: ${sent} notifications`);
+  });
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers });
-    if (request.method !== "POST") return json({ error: "Use POST for app requests." }, 405);
-    try {
-      const name = new URL(request.url).pathname.split("/").filter(Boolean).at(-1) ?? "";
-      const uid = await authenticatedUid(request, env);
-      const data = await bodyOf(request);
-      return json(await route(name, uid, data, env));
-    } catch (error) {
-      if (error instanceof ApiError) return json({ error: error.message }, error.status);
-      console.error(error);
-      return json({ error: "The server could not complete that request." }, 500);
-    }
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
+    const fs = new Firestore(env, await accessToken(env));
+    const now = Date.now();
+    // Sequential: both jobs may patch the same doc with an updateTime precondition.
+    ctx.waitUntil(sendTakenUpdates(env, fs).then(() => sendReminders(env, fs, now)));
   },
-
-  async scheduled(_event: ScheduledController, env: Env, _context: ExecutionContext) {
-    const rows = await env.DB.prepare("SELECT * FROM schedules").all<ScheduleRow>();
-    const now = new Date();
-    for (const schedule of rows.results ?? []) {
-      const local = localParts(now, schedule.timezone);
-      if (local.time !== schedule.reminder_time || schedule.last_reminder_date === local.date || schedule.last_taken_date === local.date) continue;
-      const claimed = await env.DB.prepare(`UPDATE schedules SET last_reminder_date=?
-        WHERE owner_uid=? AND reminder_time=? AND COALESCE(last_reminder_date, '')<>?
-        AND COALESCE(last_taken_date, '')<>? RETURNING owner_uid`)
-        .bind(local.date, schedule.owner_uid, local.time, local.date, local.date).first();
-      if (!claimed) continue;
-      const subscribers = await env.DB.prepare("SELECT subscriber_uid FROM subscriptions WHERE owner_uid = ?")
-        .bind(schedule.owner_uid).all<{subscriber_uid: string}>();
-      await notify(env, [schedule.owner_uid], "Pill reminder", "It’s time for today’s pill.", { type: "reminder", ownerId: schedule.owner_uid });
-      await notify(env, (subscribers.results ?? []).map((row) => row.subscriber_uid), "Pill reminder", "A pill is due now.", { type: "reminder", ownerId: schedule.owner_uid });
-    }
-  },
-};
+} satisfies ExportedHandler<Env>;

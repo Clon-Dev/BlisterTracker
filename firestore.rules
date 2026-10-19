@@ -1,7 +1,70 @@
 rules_version = '2';
+
+// Data model
+//   accounts/{uid}                  private per-device account: { pid, subs: [pid], tokens: [fcmToken] }
+//   users/{pid}                     public-ish profile + schedule, readable by owner and subscribers
+//   users/{pid}/private/auth        { key } = sha256("<pid>:<password>"), owner only
+//   users/{pid}/subscribers/{uid}   { key } — creatable only by presenting the matching key
+//
+// The Cloudflare worker uses a service account and bypasses these rules.
 service cloud.firestore {
   match /databases/{database}/documents {
-    // All user data is accessed through authenticated callable functions.
-    match /{document=**} { allow read, write: if false; }
+    // Email accounts only.
+    function signedIn() { return request.auth != null && request.auth.token.email is string; }
+    function userDoc(pid) { return /databases/$(database)/documents/users/$(pid); }
+    function ownsUser(pid) { return signedIn() && get(userDoc(pid)).data.ownerUid == request.auth.uid; }
+
+    function validSchedule(d) {
+      return d.keys().hasOnly(['ownerUid', 'name', 'pillsPerPack', 'taken', 'time', 'tz',
+                               'lastTakenDay', 'nextReminderAt', 'takenPending'])
+        && d.name is string && d.name.size() <= 30
+        && d.pillsPerPack is int && d.pillsPerPack >= 1 && d.pillsPerPack <= 42
+        && d.taken is int && d.taken >= 0 && d.taken <= d.pillsPerPack
+        && d.time is string && d.time.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
+        && d.tz is string && d.tz.size() <= 64
+        && (d.lastTakenDay == null || (d.lastTakenDay is string && d.lastTakenDay.size() == 10))
+        && (d.nextReminderAt == null || d.nextReminderAt is timestamp)
+        && d.takenPending is bool;
+    }
+
+    match /accounts/{uid} {
+      allow read, delete: if signedIn() && request.auth.uid == uid;
+      allow create, update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['pid', 'subs', 'tokens', 'lang'])
+        && (!('lang' in request.resource.data) || request.resource.data.lang in ['en', 'de'])
+        && request.resource.data.pid is string
+        && request.resource.data.subs is list && request.resource.data.subs.size() <= 20
+        && request.resource.data.tokens is list && request.resource.data.tokens.size() <= 5;
+    }
+
+    match /users/{pid} {
+      allow create: if signedIn()
+        && pid.matches('^[A-HJKMNP-Z2-9]{6}$')
+        && request.resource.data.keys().hasOnly(['ownerUid'])
+        && request.resource.data.ownerUid == request.auth.uid;
+      allow update: if signedIn()
+        && resource.data.ownerUid == request.auth.uid
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && validSchedule(request.resource.data);
+      allow delete: if signedIn() && resource.data.ownerUid == request.auth.uid;
+      allow read: if signedIn() && (resource.data.ownerUid == request.auth.uid
+        || exists(/databases/$(database)/documents/users/$(pid)/subscribers/$(request.auth.uid)));
+
+      match /private/auth {
+        allow read, delete: if ownsUser(pid);
+        allow create, update: if ownsUser(pid)
+          && request.resource.data.keys().hasOnly(['key'])
+          && request.resource.data.key is string && request.resource.data.key.size() == 64;
+      }
+
+      match /subscribers/{subUid} {
+        // Presenting the right key is the password check: the key itself is never readable by subscribers.
+        allow create, update: if signedIn() && subUid == request.auth.uid
+          && request.resource.data.keys().hasOnly(['key'])
+          && request.resource.data.key == get(/databases/$(database)/documents/users/$(pid)/private/auth).data.key
+          && get(userDoc(pid)).data.ownerUid != request.auth.uid;
+        allow read, delete: if signedIn() && (subUid == request.auth.uid || ownsUser(pid));
+      }
+    }
   }
 }

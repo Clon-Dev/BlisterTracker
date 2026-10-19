@@ -1,79 +1,60 @@
 # Blister Buddy
 
-A private iOS, Android, and Chrome app for a small circle. Firebase Anonymous Authentication identifies each user, Firebase Cloud Messaging sends mobile notifications, and a Cloudflare Worker plus D1 provide the authenticated API and daily reminder job. This avoids deploying Firebase Cloud Functions, which requires Firebase Blaze.
+A tiny private pill tracker for Android, iPhone (as a home-screen web app) and the browser.
+Owners track their blister pack; subscribers (ID + password) get notified when the pill is due and when it was taken.
 
-## Firebase setup (Spark)
+## Architecture (all free tiers)
 
-1. In Firebase, keep **Authentication → Anonymous** enabled. FCM and Firebase Authentication are available on the no-cost Spark plan.
-2. The Android and iOS app identifiers are both `com.example.blisterbuddy`. `app.json` already points at the root `google-services.json` and `GoogleService-Info.plist` files.
-3. Register a Firebase Web app and copy its values into `.env` using `.env.example` as the template. `EXPO_PUBLIC_API_BASE_URL` is filled in after the Worker is deployed.
-4. Configure APNs credentials under Firebase Project settings → Cloud Messaging to deliver notifications to iOS.
+```
+ App (Expo: Android APK + web/PWA)
+   │  Firebase Auth (email + password) + Firestore (Spark plan)
+   ▼
+ Firestore ── security rules enforce owner / subscriber access and the ID+password check
+   ▲
+   │  every minute (Firestore REST, service account)
+ Cloudflare Worker (cron only, no HTTP endpoint) ──► FCM HTTP v1 ──► phones / browsers
+```
 
-The app no longer calls Firebase Cloud Functions or reads Firestore. The manually created Firestore document `schedules/SveaBlisters` is left untouched, but it is not imported into the app. Schedules, password hashes, subscriptions, and FCM tokens are stored in Cloudflare D1 instead.
+- **Accounts**: email + password through Firebase Auth. Plain Firebase Auth is free on Spark: no per-user cost, and the verification and password-reset emails are free. The app offers register, log in, forgot password, email confirmation, change email (confirmed via a link to the new address), change password, log out (detaches this device's push token) and delete account (removes all of the account's Firestore data in one batch). Sensitive changes ask for the current password. The rules only accept tokens that carry an email.
+- **Personal ID**: random 6-character code claimed when an account first opens the app (`users/{pid}`). It belongs to the account, so it's the same on every device.
+- **Password**: the owner stores `sha256("<pid>:<password>")` in `users/{pid}/private/auth`, which only the owner can read. To subscribe, a client writes that same hash into `users/{pid}/subscribers/{uid}`. The rules only allow the write if it matches, so the password check happens inside Firestore. Changing the password does not remove existing subscribers.
+- **Reminders**: the app stores `nextReminderAt`. The Worker sends "Pill time" to the owner and subscribers and moves it to the next day, using the owner's time zone. If the pill was already marked taken that day, no reminder goes out.
+- **Taken**: marking a pill sets `takenPending`. Within a minute the Worker notifies subscribers only, then clears the flag.
+- **Pack finished**: reminders stop until the owner taps "Start a new pack". This covers the pill-free week.
+- **Languages**: English and German (`src/i18n.ts`). The device or browser language is the default, and the EN/DE switch on the home screen overrides it. The choice is stored on the account (`accounts/{uid}.lang`), so the Worker sends push notifications in that language too.
+- **Offline**: marking a pill taken, editing the schedule and changing the password update the screen immediately. Firestore syncs them once the device is back online. Only subscribing waits for the server, because the server checks the password. Subscribing is one atomic batch.
+- Data per day is a couple of small field writes, well inside Spark's limits. The Worker's queries cost about 2,900 Firestore reads a day; the free limit is 50,000.
 
-## Set up the free Cloudflare API
+Why a Worker? Spark can't run Cloud Functions, and sending FCM needs a server holding the service-account key. The Cloudflare Workers free plan includes cron triggers.
 
-Create a Cloudflare account on its Free plan, then from this project folder:
+## One-time setup
+
+1. **Firebase console** (project `blisterbuddy-8e7a4`)
+   - Authentication → Sign-in method → **Email/Password** enabled (Anonymous stays off).
+   - Project settings → Cloud Messaging → Web Push certificates → **Generate key pair**. Put the public key into `.env` as `EXPO_PUBLIC_FIREBASE_VAPID_KEY`.
+   - Project settings → Service accounts → **Generate new private key**. Save it as `worker/service-account.json` (gitignored).
+2. **Rules**: `firebase deploy --only firestore:rules`
+3. **Worker** (from `worker/`). Cloudflare only accepts cron triggers after the account has a `workers.dev` subdomain. Open Workers & Pages in the Cloudflare dashboard once to create it.
+   ```sh
+   npm install
+   npx wrangler login
+   npx wrangler secret put SERVICE_ACCOUNT_JSON < service-account.json
+   npx wrangler deploy
+   ```
+4. **Web app / iPhone**: `npm run deploy:web` deploys to https://blisterbuddy-8e7a4.web.app.
+   On iPhone, open that URL in Safari, then Share → **Add to Home Screen**. Open the app from the home screen and tap "Turn on notifications" (iOS 16.4 or newer).
+5. **Android APK**: `EAS_NO_VCS=1 npx eas-cli build --platform android --profile preview`, then install the APK from the link EAS prints.
+   `.easignore` (not `.gitignore`) decides what gets uploaded. It includes `google-services.json` and `.env`, and excludes the worker and its secrets.
+
+## Development
 
 ```sh
-cd worker
 npm install
-npx wrangler login
-npx wrangler d1 create blister-buddy
+npm run web          # http://localhost:8081
+npm run typecheck
+node --env-file=.env scripts/test-rules.mjs   # live security-rules test (creates & deletes throwaway @example.com users)
+cd worker && npm run dev                      # local worker; trigger with curl "http://localhost:8787/__scheduled"
+                                              # needs worker/.dev.vars: SERVICE_ACCOUNT_JSON='<json on one line>' 
 ```
 
-Copy the `database_id` printed by Wrangler into `worker/wrangler.toml`, replacing `REPLACE_WITH_D1_DATABASE_ID`. Then create the database tables:
-
-```sh
-npm run db:migrate:remote
-```
-
-The Worker verifies Firebase ID tokens against the Firebase project and sends FCM messages with the Firebase HTTP v1 API. It needs three secrets:
-
-- `FIREBASE_API_KEY`: the web app API key from `.env`.
-- `FCM_SERVICE_ACCOUNT_JSON`: a Firebase service account JSON key. Create it in Firebase Project settings → Service accounts. Grant that service account the **Firebase Cloud Messaging API Admin** role in Google Cloud IAM. Paste the full JSON as the value when Wrangler prompts.
-- `PASSWORD_PEPPER`: a random private value used to hash schedule passwords. Generate one locally (for example, `openssl rand -base64 32`) and paste it into Wrangler’s prompt. Do not commit or share it.
-
-Set each secret from `worker/`:
-
-```sh
-npx wrangler secret put FIREBASE_API_KEY
-npx wrangler secret put FCM_SERVICE_ACCOUNT_JSON
-npx wrangler secret put PASSWORD_PEPPER
-npx wrangler deploy
-```
-
-Wrangler prints the deployed Worker URL. Put that URL in the root `.env` as `EXPO_PUBLIC_API_BASE_URL`, then restart Expo. The Worker cron trigger runs once per minute and sends the owner and subscribers a reminder unless the pill was marked taken that day.
-
-Cloudflare’s current Free limits include 100,000 Worker requests per day and 5 million D1 row reads plus 100,000 writes per day. If D1 reaches its daily limit, queries stop until the quota resets; no automatic overage charge is applied on the Free plan. Limits and plan terms can change, so check Cloudflare’s current pricing before relying on them.
-
-## Test in Chrome
-
-After setting `.env` and deploying the Worker:
-
-```sh
-# From the project root
-npm install
-npm run web
-```
-
-Open the localhost URL printed by Expo. Chrome can test sign-in, schedule creation, subscriptions, and API calls. Browser push is not implemented; mobile FCM notifications are supported.
-
-## Build for phones
-
-FCM uses native code, so Expo Go is not sufficient. Build a development app or run locally:
-
-```sh
-npx expo run:android
-npx expo run:ios
-```
-
-For private distribution, use `eas build --profile preview --platform all`. The Android preview is an APK. iOS internal distribution requires Apple signing credentials and registered devices; neither needs an app-store release.
-
-## Data and behavior
-
-- Anonymous Firebase identity persists on the device. Removing the app or its local data may lose that identity.
-- Schedule passwords are stored as keyed hashes in D1. Changing a password does not remove existing subscribers.
-- Marking a pill taken notifies subscribers only. The scheduled reminder goes to the owner and subscribers if that day is not already marked taken.
-- Reminder times use the device time zone saved with the schedule.
-- Pack progress is a visual count; the app does not infer missed doses or give medical guidance.
+The old manually created doc `schedules/SveaBlisters` is not used. The rules leave it inaccessible to clients.
