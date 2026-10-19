@@ -14,17 +14,36 @@ service cloud.firestore {
     function userDoc(pid) { return /databases/$(database)/documents/users/$(pid); }
     function ownsUser(pid) { return signedIn() && get(userDoc(pid)).data.ownerUid == request.auth.uid; }
 
+    function isDay(v) { return v is string && v.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'); }
+    // See shared/schedule.ts for the meaning of the fields.
     function validSchedule(d) {
-      return d.keys().hasOnly(['ownerUid', 'name', 'pillsPerPack', 'taken', 'time', 'tz',
-                               'lastTakenDay', 'nextReminderAt', 'takenPending'])
+      return d.keys().hasOnly(['ownerUid', 'name', 'pillsPerPack', 'placebo', 'breakDays', 'packStart', 'trackingSince',
+                               'time', 'tz', 'repeatMinutes', 'lateMinutes', 'takenDays',
+                               'nextReminderAt', 'nextLateAt', 'takenPending',
+                               'earlierPackStarts', 'supplyPacks', 'supplyFrom', 'appointmentDay', 'appointmentNote',
+                               'reminderText', 'nextNoticeAt'])
         && d.name is string && d.name.size() <= 30
-        && d.pillsPerPack is int && d.pillsPerPack >= 1 && d.pillsPerPack <= 42
-        && d.taken is int && d.taken >= 0 && d.taken <= d.pillsPerPack
+        && d.pillsPerPack is int && d.pillsPerPack >= 1 && d.pillsPerPack <= 91
+        && d.placebo is int && d.placebo >= 0 && d.placebo < d.pillsPerPack
+        && d.breakDays is int && d.breakDays >= 0 && d.breakDays <= 14
+        && isDay(d.packStart) && isDay(d.trackingSince)
         && d.time is string && d.time.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
         && d.tz is string && d.tz.size() <= 64
-        && (d.lastTakenDay == null || (d.lastTakenDay is string && d.lastTakenDay.size() == 10))
-        && (d.nextReminderAt == null || d.nextReminderAt is timestamp)
-        && d.takenPending is bool;
+        && d.repeatMinutes in [0, 15, 30, 60]
+        && d.lateMinutes in [0, 30, 60, 120]
+        && d.takenDays is map && d.takenDays.size() <= 5000
+        && d.nextReminderAt is timestamp
+        && (d.nextLateAt == null || d.nextLateAt is timestamp)
+        && d.takenPending is bool
+        // Optional (added later; older schedules don't have them).
+        && (!('earlierPackStarts' in d) || (d.earlierPackStarts is list && d.earlierPackStarts.size() <= 100))
+        && (!('supplyPacks' in d) || (d.supplyPacks is int && d.supplyPacks >= 0 && d.supplyPacks <= 24))
+        && (!('supplyFrom' in d) || isDay(d.supplyFrom))
+        && (!('appointmentDay' in d) || d.appointmentDay == null || isDay(d.appointmentDay))
+        && (!('appointmentNote' in d) || (d.appointmentNote is string && d.appointmentNote.size() <= 80))
+        // 64 characters in the app; emoji can take several UTF-16 units each.
+        && (!('reminderText' in d) || (d.reminderText is string && d.reminderText.size() <= 256))
+        && (!('nextNoticeAt' in d) || d.nextNoticeAt == null || d.nextNoticeAt is timestamp);
     }
 
     match /accounts/{uid} {
@@ -55,6 +74,17 @@ service cloud.firestore {
         allow create, update: if ownsUser(pid)
           && request.resource.data.keys().hasOnly(['key'])
           && request.resource.data.key is string && request.resource.data.key.size() == 64;
+      }
+
+      // Daily notes: "shared" is readable by followers, "private" only by the owner.
+      // { days: { "YYYY-MM-DD": { text, mood } } }
+      match /notes/{which} {
+        allow read: if ownsUser(pid) || (which == 'shared' && signedIn()
+          && exists(/databases/$(database)/documents/users/$(pid)/subscribers/$(request.auth.uid)));
+        allow delete: if ownsUser(pid);
+        allow create, update: if ownsUser(pid) && which in ['shared', 'private']
+          && request.resource.data.keys().hasOnly(['days'])
+          && request.resource.data.days is map && request.resource.data.days.size() <= 5000;
       }
 
       match /subscribers/{subUid} {

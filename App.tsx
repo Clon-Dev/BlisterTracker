@@ -1,43 +1,65 @@
-import { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, AppState, Pressable, ScrollView, Text, useWindowDimensions, View } from "react-native";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { ActivityIndicator, AppState, Platform, Pressable, ScrollView, Text, useColorScheme, useWindowDimensions, View } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
+import { useFonts } from "expo-font";
 import * as Clipboard from "expo-clipboard";
+import * as Haptics from "expo-haptics";
+import { LinearGradient } from "expo-linear-gradient";
 import { onAuthStateChanged, type User } from "firebase/auth";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import {
+  AlertTriangle, BellRing, CalendarDays, Check, Clock3, Copy, KeyRound, MailWarning, Moon, Pill, Plus, SkipForward, SlidersHorizontal,
+  UserMinus, UserPlus, UserRound, type LucideIcon,
+} from "lucide-react-native";
+import { addDays, cycleLength, dayKey, isTaken, slot, zonedTime } from "./shared/schedule";
 import { auth } from "./src/firebase";
 import { AccountScreen } from "./src/AccountScreen";
 import { setAuthLanguage, resendVerification } from "./src/auth";
 import { AuthScreen } from "./src/AuthScreen";
-import { Blister, packStartWeekday } from "./src/Blister";
+import { Blister } from "./src/Blister";
 import {
-  dayKey, ensureAccount, fetchHasPassword, hasSchedule, markTaken, packFinished, registerToken, setAccountLang,
-  startNewPack, takenToday, unsubscribe, watchAccount, watchProfile, watchSubscriberCount,
-  type Account, type Profile, type Schedule,
+  deviceTz, ensureAccount, fetchHasPassword, hasSchedule, registerToken, setAccountLang, setTaken, setTimezone, todayOf,
+  unsubscribe, watchAccount, watchNotes, watchProfile, watchSubscriberCount, type Account, type Notes, type Profile, type Schedule,
 } from "./src/data";
-import { confirm, notify } from "./src/dialog";
+import { NoteCard, NoteLine, openEarlyPackSheet, SuppliesCard, TravelNotice, type OwnNote } from "./src/HomeCards";
 import { PasswordForm, ScheduleWizard, SubscribeForm } from "./src/Forms";
-import { loadSavedLang, useI18n, type Strings } from "./src/i18n";
-import { enablePush, pushStatus, type PushStatus } from "./src/push";
-import { Button, C, Card, errorText, LanguageSwitch, LinkButton, queued, s } from "./src/ui";
+import { HistoryScreen } from "./src/HistoryScreen";
+import { formatDay, loadSavedLang, useI18n, type Lang, type Strings } from "./src/i18n";
+import { missedDays, packCells } from "./src/pack";
+import { enablePush, onTakenAction, pushStatus, registerTakenAction, type PushStatus } from "./src/push";
+import { alert, confirm, SheetHost, toast, ToastHost } from "./src/sheets";
+import { openDaySheet } from "./src/TakenTime";
+import { C, F, fonts, G, loadAppearance, R, setSystemDark, shadow, themedStyles, useThemeVersion } from "./src/theme";
+import { errorText, queued } from "./src/errors";
+import { Badge, Button, Card, IconButton, LanguageSwitch, LinkButton, ProgressRing, s, SectionTitle } from "./src/ui";
 
-type Screen = "home" | "password" | "subscribe" | "schedule" | "account";
+type Screen = "home" | "password" | "subscribe" | "schedule" | "account" | "history";
 type Followed = Profile | "denied" | undefined;
 
 export default function App() {
+  const [fontsLoaded] = useFonts(fonts);
+  const systemDark = useColorScheme() === "dark";
+  const [themeReady, setThemeReady] = useState(false);
+  useEffect(() => { loadAppearance(systemDark).then(() => setThemeReady(true)); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (themeReady) setSystemDark(systemDark); }, [systemDark, themeReady]);
+  useThemeVersion(); // re-render with the new palette
   return (
     <SafeAreaProvider>
       <SafeAreaView style={{ flex: 1, backgroundColor: C.bg }} edges={["top", "left", "right"]}>
-        <StatusBar style="dark" />
-        <Root />
+        <StatusBar style={C.dark ? "light" : "dark"} />
+        {fontsLoaded && themeReady ? <Root /> : <View style={{ flex: 1 }} />}
+        <SheetHost />
+        <ToastHost />
       </SafeAreaView>
     </SafeAreaProvider>
   );
 }
 
-const scrollContent = { padding: 18, paddingBottom: 48, width: "100%", maxWidth: 520, alignSelf: "center" } as const;
+const scrollContent = { padding: 20, paddingBottom: 56, width: "100%", maxWidth: 560, alignSelf: "center" } as const;
 
 const Loading = ({ text }: { text: string }) => (
-  <View style={{ flex: 1, alignItems: "center", justifyContent: "center", gap: 12 }}>
+  <View style={{ flex: 1, alignItems: "center", justifyContent: "center", gap: 14 }}>
     <ActivityIndicator size="large" color={C.primary} />
     <Text style={s.muted}>{text}</Text>
   </View>
@@ -46,6 +68,7 @@ const Loading = ({ text }: { text: string }) => (
 /** Login gate: without an account only the login/register screen is shown. */
 function Root() {
   const { t, lang } = useI18n();
+  const themeVersion = useThemeVersion();
   const [user, setUser] = useState<User | null | undefined>(undefined);
 
   useEffect(() => setAuthLanguage(lang), [lang]);
@@ -57,7 +80,7 @@ function Root() {
 
   if (user === undefined) return <Loading text={t.loading} />;
   if (!user) return (
-    <ScrollView contentContainerStyle={scrollContent} keyboardShouldPersistTaps="handled">
+    <ScrollView key={themeVersion} contentContainerStyle={scrollContent} keyboardShouldPersistTaps="handled">
       <AuthScreen />
     </ScrollView>
   );
@@ -66,19 +89,22 @@ function Root() {
 
 /** Re-renders when the local date changes, so "taken today" flips at midnight even if the app stays open. */
 function useToday() {
-  const [today, setToday] = useState(() => dayKey(new Date()));
+  const [today, setToday] = useState(() => dayKey(Date.now(), deviceTz()));
   useEffect(() => {
-    const id = setInterval(() => setToday(dayKey(new Date())), 60_000);
+    const id = setInterval(() => setToday(dayKey(Date.now(), deviceTz())), 60_000);
     return () => clearInterval(id);
   }, []);
   return today;
 }
 
+const celebrate = () => { if (Platform.OS !== "web") Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); };
+
 function Main({ user }: { user: User }) {
   const { t, lang } = useI18n();
-  useToday();
+  const themeVersion = useThemeVersion();
+  const today = useToday();
   const uid = user.uid;
-  const width = Math.min(useWindowDimensions().width, 520);
+  const width = Math.min(useWindowDimensions().width, 560);
   const [account, setAccount] = useState<Account | null>(null);
   const [own, setOwn] = useState<Profile | null>(null);
   const [followed, setFollowed] = useState<Record<string, Followed>>({});
@@ -88,6 +114,11 @@ function Main({ user }: { user: User }) {
   const [pushToken, setPushToken] = useState<string | null>(null);
   const [emailVerified, setEmailVerified] = useState(user.emailVerified);
   const [screen, setScreen] = useState<Screen>("home");
+  const [historyOf, setHistoryOf] = useState<string | null>(null);
+  const [sharedNotes, setSharedNotes] = useState<Notes>({});
+  const [privateNotes, setPrivateNotes] = useState<Notes>({});
+  const [followedNotes, setFollowedNotes] = useState<Record<string, Notes>>({});
+  const [keptZones, setKeptZones] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
 
@@ -116,7 +147,10 @@ function Main({ user }: { user: User }) {
   const pid = account?.pid;
   useEffect(() => {
     if (!pid) return;
-    const unsubs = [watchProfile(pid, setOwn), watchSubscriberCount(pid, setSubscriberCount)];
+    const unsubs = [
+      watchProfile(pid, setOwn), watchSubscriberCount(pid, setSubscriberCount),
+      watchNotes(pid, "shared", setSharedNotes), watchNotes(pid, "private", setPrivateNotes),
+    ];
     fetchHasPassword(pid).then(setPasswordSet, () => undefined);
     return () => unsubs.forEach((u) => u());
   }, [pid]);
@@ -126,9 +160,12 @@ function Main({ user }: { user: User }) {
   useEffect(() => {
     const pids = subsKey ? subsKey.split(",") : [];
     setFollowed((f) => Object.fromEntries(pids.map((p) => [p, f[p]])));
-    const unsubs = pids.map((p) => watchProfile(p,
-      (profile) => setFollowed((f) => ({ ...f, [p]: profile ?? "denied" })),
-      () => setFollowed((f) => ({ ...f, [p]: "denied" }))));
+    const unsubs = pids.flatMap((p) => [
+      watchProfile(p,
+        (profile) => setFollowed((f) => ({ ...f, [p]: profile ?? "denied" })),
+        () => setFollowed((f) => ({ ...f, [p]: "denied" }))),
+      watchNotes(p, "shared", (n) => setFollowedNotes((f) => ({ ...f, [p]: n }))),
+    ]);
     return () => unsubs.forEach((u) => u());
   }, [subsKey]);
 
@@ -143,17 +180,52 @@ function Main({ user }: { user: User }) {
       setPush(await pushStatus());
       setPushToken(token);
       if (token) await registerToken(uid, account, token);
-      else if (ask) notify(t.pushOffTitle, t.pushOffBody);
+      else if (ask) alert(t.pushOffTitle, t.pushOffBody);
     } catch (e) {
-      if (ask) notify(t.errorTitle, errorText(e));
+      if (ask) alert(t.errorTitle, errorText(e));
     }
   }, [uid, account, t]);
 
   useEffect(() => { refreshPush(false); }, [pid]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const schedule = hasSchedule(own) ? own : null;
+  /** Own notes from both docs, marked with where they live. */
+  const ownNotes = useMemo(() => {
+    const all: Record<string, OwnNote> = {};
+    for (const [d, n] of Object.entries(privateNotes)) all[d] = { ...n, shared: false };
+    for (const [d, n] of Object.entries(sharedNotes)) all[d] = { ...n, shared: true };
+    return all;
+  }, [sharedNotes, privateNotes]);
+
+  // Travelling: the device is in another zone than the schedule. "Keep home time" is remembered per zone pair.
+  const here = deviceTz();
+  const zonePair = schedule ? `${schedule.tz}>${here}` : null;
+  useEffect(() => { AsyncStorage.getItem("keptZones").then(setKeptZones, () => undefined); }, []);
+  const showTravel = !!schedule && schedule.tz !== here && keptZones !== zonePair;
+
+  /** Opens the day sheet (now / earlier / change / unmark) and saves the choice. */
+  const editDay = useCallback(async (sch: Schedule, day: string) => {
+    if (!pid || slot(sch, day).kind === "break" || day > todayOf(sch) || day < sch.trackingSince) return;
+    const action = await openDaySheet(sch, day, lang);
+    if (!action) return;
+    queued(setTaken(pid, sch, day, "untake" in action ? null : action.time));
+    if (!("untake" in action)) { celebrate(); toast(t.markedToast); }
+  }, [pid, lang, t]);
+
+  // "Taken" button on the reminder notification: opens the day sheet once the schedule has loaded
+  // (when the button launches the app, the action arrives first).
+  const [pendingTaken, setPendingTaken] = useState<{ pid: string; day: string } | null>(null);
+  useEffect(() => { registerTakenAction(t.notificationTaken); }, [t]);
+  useEffect(() => onTakenAction((actionPid, day) => setPendingTaken({ pid: actionPid, day })), []);
+  useEffect(() => {
+    if (!pendingTaken || !pid || !schedule) return;
+    setPendingTaken(null);
+    if (pendingTaken.pid === pid && !isTaken(schedule, pendingTaken.day)) editDay(schedule, pendingTaken.day);
+  }, [pendingTaken, pid, schedule, editDay]);
+
   if (error) return (
     <View style={{ flex: 1, justifyContent: "center", padding: 24 }}>
-      <Text style={s.h2}>{t.errorTitle}</Text>
+      <Text style={s.h1}>{t.errorTitle}</Text>
       <Text style={[s.muted, { marginTop: 8 }]}>{error}</Text>
       <Button title={t.tryAgain} onPress={() => { setError(null); setAttempt((n) => n + 1); }} />
     </View>
@@ -161,69 +233,72 @@ function Main({ user }: { user: User }) {
   if (!account) return <Loading text={t.loading} />;
 
   const home = () => setScreen("home");
-  const schedule = hasSchedule(own) ? own : null;
+  const showHistory = (p: string) => { setHistoryOf(p); setScreen("history"); };
+  const historyProfile = historyOf === account.pid ? own : historyOf ? followed[historyOf] : null;
+  const historySchedule = historyProfile && historyProfile !== "denied" && hasSchedule(historyProfile) ? historyProfile : null;
 
   return (
-    // key: each screen starts scrolled to the top.
-    <ScrollView key={screen} contentContainerStyle={scrollContent} keyboardShouldPersistTaps="handled">
+    // key: each screen starts scrolled to the top; a theme switch redraws everything with the new palette.
+    <ScrollView key={`${screen}-${themeVersion}`} contentContainerStyle={scrollContent} keyboardShouldPersistTaps="handled">
       {screen === "account" && <AccountScreen user={user} account={account} pushToken={pushToken} onBack={home} />}
       {screen === "password" && <PasswordForm pid={account.pid} hasPassword={passwordSet} onSaved={() => { setPasswordSet(true); home(); }} onBack={home} />}
       {screen === "subscribe" && <SubscribeForm uid={uid} ownPid={account.pid} onBack={home} />}
       {screen === "schedule" && <ScheduleWizard uid={uid} pid={account.pid} current={own} width={width} onBack={home} />}
+      {screen === "history" && historySchedule && (
+        <HistoryScreen schedule={historySchedule} onBack={home}
+          notes={historyOf === account.pid ? ownNotes : followedNotes[historyOf!] ?? {}}
+          ownerPid={historyOf === account.pid ? account.pid : undefined}
+          onEditDay={historyOf === account.pid ? (day) => editDay(historySchedule, day) : undefined} />
+      )}
       {screen === "home" && <>
-        <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 8 }}>
-          <Text style={s.title}>Blister Buddy</Text>
+        <View style={st.topBar}>
+          <LinearGradient colors={G.primary} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={st.logo}>
+            <Pill size={20} color={C.white} strokeWidth={2.4} />
+          </LinearGradient>
+          <Text style={[s.h2, F.extrabold, { flex: 1 }]} numberOfLines={1}>Blister Buddy</Text>
           <LanguageSwitch />
-        </View>
-        <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
-          <Text style={[s.muted, { flex: 1 }]} numberOfLines={1}>{user.email}</Text>
-          <LinkButton title={`${t.account} ›`} onPress={() => setScreen("account")} />
-        </View>
-
-        <View style={{ backgroundColor: C.primary, borderRadius: 22, padding: 20, marginTop: 4 }}>
-          <Text style={{ color: "#F9DCE7", fontSize: 13, fontWeight: "700", letterSpacing: 1 }}>{t.yourId}</Text>
-          <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 6 }}>
-            <Text selectable style={{ color: "#FFF", fontSize: 36, fontWeight: "800", letterSpacing: 4 }} testID="personal-id">{account.pid}</Text>
-            <Pressable onPress={() => Clipboard.setStringAsync(account.pid).then(() => notify(t.copied, t.copiedBody({ pid: account.pid })))}
-              style={{ backgroundColor: "#FFFFFF33", paddingHorizontal: 14, paddingVertical: 8, borderRadius: 12 }} accessibilityRole="button">
-              <Text style={{ color: "#FFF", fontWeight: "700" }}>{t.copy}</Text>
-            </Pressable>
-          </View>
-          <Text style={{ color: "#FBE8EF", marginTop: 8, fontSize: 13, lineHeight: 18 }}>
-            {passwordSet ? t.subscriberLine({ n: subscriberCount }) : t.noPasswordHint}
-          </Text>
+          <IconButton icon={UserRound} label={t.account} onPress={() => setScreen("account")} />
         </View>
 
         {!emailVerified && (
-          <Card style={{ backgroundColor: "#FFF8E8", borderColor: "#F3E1B5" }}>
-            <Text style={s.body}>{t.verifyBanner({ email: user.email ?? "" })}</Text>
-            <LinkButton title={t.verifyResend} onPress={() => resendVerification(user).then(() => notify(t.verifySent), (e) => notify(t.errorTitle, errorText(e)))} />
-          </Card>
+          <Notice icon={MailWarning} tone="warning" text={t.verifyBanner({ email: user.email ?? "" })}
+            action={t.verifyResend} onAction={() => resendVerification(user).then(() => toast(t.verifySent), (e) => alert(t.errorTitle, errorText(e)))} />
         )}
-        {push && <PushBanner status={push} t={t} onEnable={() => refreshPush(true)} />}
-
-        <Button title={t.followSchedule} onPress={() => setScreen("subscribe")} style={{ marginTop: 16 }} />
-        {/* Both of these concern your own schedule, so they sit together. */}
-        <View style={{ flexDirection: "row", gap: 10 }}>
-          <Button kind="secondary" title={schedule ? t.editSchedule : t.createSchedule} onPress={() => setScreen("schedule")} style={{ flex: 1 }} />
-          <Button kind="secondary" title={passwordSet ? t.changePassword : t.setPassword} onPress={() => setScreen("password")} style={{ flex: 1 }} />
-        </View>
-
-        {schedule && (
-          <OwnSchedule schedule={schedule} width={width} t={t}
-            onTaken={async () => {
-              if (await confirm(t.markTakenTitle, t.markTakenBody, t.markTakenOk)) queued(markTaken(account.pid, schedule));
-            }}
-            onNewPack={() => queued(startNewPack(account.pid, schedule))} />
+        {push && push !== "granted" && (
+          <Notice icon={BellRing} tone="primary"
+            text={{ default: t.pushDefault, denied: t.pushDenied, "needs-install": t.pushInstall, unsupported: t.pushUnsupported }[push]}
+            action={push === "default" ? t.pushEnable : undefined} onAction={() => refreshPush(true)} />
         )}
 
-        {account.subs.length > 0 && <Text style={[s.h2, { marginTop: 26 }]}>{t.following}</Text>}
+        {schedule && showTravel && (
+          <TravelNotice schedule={schedule} deviceTz={here} t={t}
+            onUseLocal={() => { queued(setTimezone(account.pid, schedule, here)); toast(t.tzSwitched); }}
+            onKeep={() => { setKeptZones(zonePair); AsyncStorage.setItem("keptZones", zonePair!).catch(() => undefined); }} />
+        )}
+
+        {schedule
+          ? <OwnSchedule schedule={schedule} today={today} width={width} t={t} lang={lang}
+              onEditDay={(day) => editDay(schedule, day)} onHistory={() => showHistory(account.pid)} onEdit={() => setScreen("schedule")}
+              onEarlyPack={() => openEarlyPackSheet(account.pid, schedule, lang)}
+              extra={<>
+                <NoteCard pid={account.pid} day={todayOf(schedule)} note={ownNotes[todayOf(schedule)] ?? null} />
+              </>}
+              after={<SuppliesCard pid={account.pid} schedule={schedule} />} />
+          : <SetupCard t={t} onCreate={() => setScreen("schedule")} />}
+
+        <IdCard pid={account.pid} passwordSet={passwordSet} followers={subscriberCount} t={t} onPassword={() => setScreen("password")} />
+
+        <Button title={t.followSchedule} icon={UserPlus} onPress={() => setScreen("subscribe")} style={{ marginTop: 18 }} />
+
+        {account.subs.length > 0 && <SectionTitle title={t.following} />}
         {account.subs.map((p) => (
-          <FollowedSchedule key={p} pid={p} profile={followed[p]} width={width} t={t}
+          <FollowedSchedule key={p} pid={p} profile={followed[p]} notes={followedNotes[p] ?? {}} today={today} width={width} t={t} onHistory={() => showHistory(p)}
             onRemove={async () => {
               const f = followed[p];
               const name = (f && f !== "denied" && f.name) || p;
-              if (await confirm(t.unsubscribeTitle, t.unsubscribeBody({ name }), t.unsubscribe)) queued(unsubscribe(uid, p));
+              if (await confirm({ title: t.unsubscribeTitle, message: t.unsubscribeBody({ name }), confirmLabel: t.unsubscribe, destructive: true, icon: UserMinus })) {
+                queued(unsubscribe(uid, p));
+              }
             }} />
         ))}
       </>}
@@ -231,77 +306,216 @@ function Main({ user }: { user: User }) {
   );
 }
 
-function PushBanner({ status, t, onEnable }: { status: PushStatus; t: Strings; onEnable: () => void }) {
-  if (status === "granted") return null;
-  const text = { default: t.pushDefault, denied: t.pushDenied, "needs-install": t.pushInstall, unsupported: t.pushUnsupported }[status];
-  return (
-    <Card style={{ backgroundColor: "#FFF8E8", borderColor: "#F3E1B5" }}>
-      <Text style={s.body}>{text}</Text>
-      {status === "default" && <Button title={t.pushEnable} onPress={onEnable} />}
-    </Card>
-  );
-}
-
-function StatusPill({ sch, t }: { sch: Schedule; t: Strings }) {
-  const done = takenToday(sch) || packFinished(sch);
-  const label = takenToday(sch) ? t.takenToday : packFinished(sch) ? t.packFinished : t.dueAt({ time: sch.time });
-  return (
-    <View style={{ alignSelf: "flex-start", backgroundColor: done ? C.successSoft : C.primarySoft, borderRadius: 12, paddingHorizontal: 10, paddingVertical: 4, marginTop: 6 }}>
-      <Text style={{ color: done ? C.success : C.primaryDark, fontWeight: "700", fontSize: 13 }}>{label}</Text>
-    </View>
-  );
-}
-
-function PackView({ sch, width }: { sch: Schedule; width: number }) {
-  const done = takenToday(sch);
-  return (
-    <View style={{ alignItems: "center", marginTop: 14 }}>
-      <Blister count={sch.pillsPerPack} taken={sch.taken} width={width}
-        showNext={!done && !packFinished(sch)} startWeekday={packStartWeekday(sch.taken, done)} />
-    </View>
-  );
-}
-
-function OwnSchedule({ schedule, width, t, onTaken, onNewPack }: {
-  schedule: Schedule; width: number; t: Strings; onTaken: () => void; onNewPack: () => void;
+function Notice({ icon: Icon, tone, text, action, onAction }: {
+  icon: LucideIcon; tone: "warning" | "primary" | "danger"; text: string; action?: string; onAction?: () => void;
 }) {
-  const done = takenToday(schedule);
+  const [bg, fg] = { warning: [C.warningSoft, C.warning], primary: [C.primarySoft, C.primaryDeep], danger: [C.dangerSoft, C.danger] }[tone];
   return (
-    <Card style={{ marginTop: 22 }}>
-      <Text style={s.h2}>{t.myPack}</Text>
-      <StatusPill sch={schedule} t={t} />
-      <PackView sch={schedule} width={Math.min(width - 72, 420)} />
-      <Text style={[s.muted, { textAlign: "center", marginTop: 8 }]}>
-        {t.ownProgress({ taken: schedule.taken, total: schedule.pillsPerPack, time: schedule.time })}
-      </Text>
-      {packFinished(schedule)
-        ? <Button title={t.newPack} onPress={onNewPack} />
-        : <Button title={done ? t.alreadyTaken : t.markTaken} onPress={onTaken} disabled={done} />}
-    </Card>
+    <View style={[st.notice, { backgroundColor: bg }]}>
+      <View style={[st.iconDot, { backgroundColor: C.card }]}><Icon size={18} color={fg} strokeWidth={2.4} /></View>
+      <View style={{ flex: 1 }}>
+        <Text style={[s.small, F.semibold, { color: C.text, lineHeight: 19 }]}>{text}</Text>
+        {action && onAction && (
+          <Pressable onPress={onAction} accessibilityRole="button" accessibilityLabel={action} hitSlop={6} style={{ marginTop: 6, alignSelf: "flex-start" }}>
+            <Text style={[s.small, F.extrabold, { color: fg }]}>{action} →</Text>
+          </Pressable>
+        )}
+      </View>
+    </View>
   );
 }
 
-function FollowedSchedule({ pid, profile, width, t, onRemove }: { pid: string; profile: Followed; width: number; t: Strings; onRemove: () => void }) {
-  const sch = profile && profile !== "denied" && hasSchedule(profile) ? profile : null;
+function SetupCard({ t, onCreate }: { t: Strings; onCreate: () => void }) {
+  return (
+    <LinearGradient colors={G.hero} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={[st.hero, shadow(3)]}>
+      <View style={st.heroBubble} />
+      <View style={[st.iconDot, { width: 52, height: 52, borderRadius: 26, backgroundColor: "rgba(255,255,255,0.22)" }]}>
+        <Pill size={26} color={C.white} strokeWidth={2.2} />
+      </View>
+      <Text style={[s.h1, { color: C.white, marginTop: 14 }]}>{t.setupTitle}</Text>
+      <Text style={[s.body, { color: "rgba(255,255,255,0.88)", marginTop: 6 }]}>{t.setupBody}</Text>
+      <Button title={t.createSchedule} kind="light" icon={Plus} onPress={onCreate} style={{ marginTop: 18 }} />
+    </LinearGradient>
+  );
+}
+
+type Today = { state: "break" | "taken" | "due" | "overdue"; day: string; index: number; placebo: boolean; nextPack: string };
+
+/** What today looks like for a schedule, in its own time zone. */
+function todayInfo(sch: Schedule): Today {
+  const day = todayOf(sch);
+  const { kind, index, packStart } = slot(sch, day);
+  const base = { day, index, placebo: kind === "placebo", nextPack: addDays(packStart, cycleLength(sch)) };
+  if (kind === "break") return { ...base, state: "break" };
+  if (isTaken(sch, day)) return { ...base, state: "taken" };
+  return { ...base, state: Date.now() > zonedTime(day, sch.time, sch.tz) ? "overdue" : "due" };
+}
+
+function StatusBadge({ sch, t }: { sch: Schedule; t: Strings }) {
+  const info = todayInfo(sch);
+  const time = sch.takenDays[info.day];
+  if (info.state === "break") return <Badge tone="neutral" icon={Moon} label={t.heroBreak} />;
+  if (info.state === "taken") return <Badge tone="success" icon={Check} label={time ? t.takenAtShort({ time }) : t.takenUnknown} />;
+  if (info.state === "overdue") return <Badge tone="danger" icon={AlertTriangle} label={t.overdue({ time: sch.time })} />;
+  return <Badge tone="primary" icon={BellRing} label={info.placebo ? t.placeboDue({ time: sch.time }) : t.dueAt({ time: sch.time })} />;
+}
+
+/** Blister of the current pack. `today` (device day) only triggers the recompute at midnight. */
+function PackView({ sch, today, width, onPressDay }: { sch: Schedule; today: string; width: number; onPressDay?: (day: string) => void }) {
+  const { cells, startWeekday } = useMemo(() => packCells(sch, todayOf(sch)), [sch, today]); // eslint-disable-line react-hooks/exhaustive-deps
+  return (
+    <View style={{ alignItems: "center", marginTop: 16 }}>
+      <Blister cells={cells} startWeekday={startWeekday} width={width} onPressCell={onPressDay && ((i) => onPressDay(cells[i].day))} />
+    </View>
+  );
+}
+
+function Legend({ t, sch }: { t: Strings; sch: Schedule }) {
+  const items: [string, object][] = [
+    [t.legendTaken, { backgroundColor: C.hole[0] }],
+    [t.legendMissed, { borderWidth: 2.5, borderColor: C.danger }],
+  ];
+  if (sch.placebo > 0) items.push([t.legendPlacebo, { backgroundColor: C.placebo[1], borderWidth: 1, borderColor: C.placeboStroke }]);
+  if (sch.breakDays > 0) items.push([t.legendBreak, { borderWidth: 1.5, borderStyle: "dashed", borderColor: C.breakStroke }]);
+  return (
+    <View style={{ flexDirection: "row", flexWrap: "wrap", justifyContent: "center", gap: 14, marginTop: 14 }}>
+      {items.map(([label, dot]) => (
+        <View key={label} style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+          <View style={[{ width: 12, height: 12, borderRadius: 6 }, dot]} />
+          <Text style={s.small}>{label}</Text>
+        </View>
+      ))}
+    </View>
+  );
+}
+
+function OwnSchedule({ schedule, today, width, t, lang, onEditDay, onHistory, onEdit, onEarlyPack, extra, after }: {
+  schedule: Schedule; today: string; width: number; t: Strings; lang: Lang;
+  onEditDay: (day: string) => void; onHistory: () => void; onEdit: () => void; onEarlyPack: () => void;
+  /** Rendered between the hero and the pack card / after the pack card. */
+  extra: React.ReactNode; after: React.ReactNode;
+}) {
+  const info = todayInfo(schedule);
+  const takenTime = schedule.takenDays[info.day];
+  const missed = missedDays(schedule, info.day, 7);
+  const yesterday = addDays(info.day, -1);
+  const isBreak = info.state === "break";
+  const n = isBreak ? info.index - schedule.pillsPerPack + 1 : info.index + 1;
+  const total = isBreak ? schedule.breakDays : schedule.pillsPerPack;
+  const headline = info.state === "break" ? t.heroBreak
+    : info.state === "taken" ? (takenTime ? t.takenAtShort({ time: takenTime }) : t.takenUnknown)
+    : info.state === "overdue" ? t.heroOverdue({ time: schedule.time })
+    : t.heroDue({ time: schedule.time });
+  const sub = isBreak ? t.heroBreakSub({ date: formatDay(info.nextPack, lang) })
+    : `${info.placebo ? `${t.legendPlacebo} · ` : ""}${t.reminderSub({ time: schedule.time, repeat: schedule.repeatMinutes })}`;
+
+  return (
+    <>
+      <LinearGradient colors={G.hero} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={[st.hero, shadow(3)]}>
+        <View style={st.heroBubble} />
+        <View style={[st.heroBubble, { width: 130, height: 130, right: undefined, top: undefined, left: -45, bottom: -60, opacity: 0.08 }]} />
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 18 }}>
+          <ProgressRing progress={n / total} size={92} stroke={8} light>
+            <Text style={[F.extrabold, { fontSize: 28, color: C.white, letterSpacing: -1 }]}>{n}</Text>
+            <Text style={[s.small, F.bold, { color: "rgba(255,255,255,0.8)", marginTop: -2 }]}>/ {total}</Text>
+          </ProgressRing>
+          <View style={{ flex: 1 }}>
+            <Text style={[s.eyebrow, { color: "rgba(255,255,255,0.75)" }]}>{isBreak ? t.breakOf({ n, total }) : t.today}</Text>
+            <Text style={[s.h1, { color: C.white, marginTop: 4 }]}>{headline}</Text>
+            <Text style={[s.small, { color: "rgba(255,255,255,0.85)", marginTop: 4 }]}>{sub}</Text>
+          </View>
+        </View>
+        {!isBreak && (info.state === "taken"
+          ? <Button title={t.changeTime} kind="light" icon={Clock3} compact onPress={() => onEditDay(info.day)} style={{ marginTop: 18 }} />
+          : <Button title={t.takeCta} kind="light" icon={Check} onPress={() => onEditDay(info.day)} style={{ marginTop: 18 }} />)}
+      </LinearGradient>
+
+      {missed.length > 0 && (
+        <Notice icon={AlertTriangle} tone="danger"
+          text={missed.length === 1 && missed[0] === yesterday ? t.missedOne : t.missedMany({ n: missed.length })}
+          action={missed.includes(yesterday) ? t.markYesterday : undefined} onAction={() => onEditDay(yesterday)} />
+      )}
+
+      {extra}
+
+      <Card>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+          <View style={{ flex: 1 }}>
+            <Text style={s.h2} numberOfLines={1}>{schedule.name || t.myPack}</Text>
+            <Text style={[s.small, { marginTop: 2 }]}>{isBreak ? t.breakOf({ n, total }) : t.pillOfShort({ n, total })}</Text>
+          </View>
+          <IconButton icon={CalendarDays} label={t.history} onPress={onHistory} />
+          <IconButton icon={SkipForward} label={t.earlyTitle} onPress={onEarlyPack} />
+          <IconButton icon={SlidersHorizontal} label={t.editSchedule} onPress={onEdit} />
+        </View>
+        <PackView sch={schedule} today={today} width={Math.min(width - 82, 440)} onPressDay={onEditDay} />
+        <Legend t={t} sch={schedule} />
+      </Card>
+      {after}
+    </>
+  );
+}
+
+function IdCard({ pid, passwordSet, followers, t, onPassword }: { pid: string; passwordSet: boolean; followers: number; t: Strings; onPassword: () => void }) {
   return (
     <Card>
-      <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start" }}>
-        <View style={{ flex: 1 }}>
-          <Text style={s.h2}>{sch?.name || pid}</Text>
-          {sch?.name ? <Text style={s.muted}>{pid}</Text> : null}
-          {sch && <StatusPill sch={sch} t={t} />}
-        </View>
-        <Pressable onPress={onRemove} hitSlop={10} accessibilityRole="button"><Text style={{ color: C.muted, fontWeight: "600" }}>{t.unsubscribe}</Text></Pressable>
+      <Text style={s.eyebrow}>{t.yourId}</Text>
+      <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 6 }}>
+        <Text selectable style={st.pid} testID="personal-id">{pid}</Text>
+        <IconButton icon={Copy} label={t.copy} onPress={() => Clipboard.setStringAsync(pid).then(() => toast(t.copiedBody({ pid })))} />
       </View>
-      {profile === undefined && <ActivityIndicator color={C.primary} style={{ marginTop: 12 }} />}
-      {profile === "denied" && <Text style={[s.muted, { marginTop: 8 }]}>{t.noLongerAvailable}</Text>}
-      {profile && profile !== "denied" && !sch && <Text style={[s.muted, { marginTop: 8 }]}>{t.noScheduleYet}</Text>}
-      {sch && (
-        <>
-          <PackView sch={sch} width={Math.min(width - 72, 360)} />
-          <Text style={[s.muted, { textAlign: "center", marginTop: 8 }]}>{t.progress({ taken: sch.taken, total: sch.pillsPerPack })}</Text>
-        </>
-      )}
+      <View style={st.divider} />
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+        <View style={[st.iconDot, { backgroundColor: passwordSet ? C.successSoft : C.primarySoft }]}>
+          <KeyRound size={18} color={passwordSet ? C.success : C.primaryDeep} strokeWidth={2.4} />
+        </View>
+        <Text style={[s.small, F.semibold, { flex: 1, color: C.text }]}>{passwordSet ? t.subscriberLine({ n: followers }) : t.noPasswordHint}</Text>
+      </View>
+      <Button title={passwordSet ? t.changePassword : t.setPassword} kind="secondary" compact onPress={onPassword} />
     </Card>
   );
 }
+
+function FollowedSchedule({ pid, profile, notes, today, width, t, onHistory, onRemove }: {
+  pid: string; profile: Followed; notes: Notes; today: string; width: number; t: Strings; onHistory: () => void; onRemove: () => void;
+}) {
+  const sch = profile && profile !== "denied" && hasSchedule(profile) ? profile : null;
+  const todaysNote = sch ? notes[todayOf(sch)] : undefined;
+  const name = sch?.name || pid;
+  return (
+    <Card>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 14 }}>
+        <LinearGradient colors={G.avatar} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={st.avatar}>
+          <Text style={[F.extrabold, { color: C.white, fontSize: 18 }]}>{name.slice(0, 1).toUpperCase()}</Text>
+        </LinearGradient>
+        <View style={{ flex: 1 }}>
+          <Text style={s.h2} numberOfLines={1}>{name}</Text>
+          {sch?.name ? <Text style={s.small}>{pid}</Text> : null}
+        </View>
+      </View>
+      {sch && <View style={{ marginTop: 14 }}><StatusBadge sch={sch} t={t} /></View>}
+      {profile === undefined && <ActivityIndicator color={C.primary} style={{ marginTop: 14 }} />}
+      {profile === "denied" && <Text style={[s.muted, { marginTop: 12 }]}>{t.noLongerAvailable}</Text>}
+      {profile && profile !== "denied" && !sch && <Text style={[s.muted, { marginTop: 12 }]}>{t.noScheduleYet}</Text>}
+      {todaysNote && <View style={{ marginTop: 12 }}><NoteLine note={todaysNote} label={t.todaysNote} /></View>}
+      {sch && <PackView sch={sch} today={today} width={Math.min(width - 82, 400)} />}
+      <View style={[st.divider, { marginBottom: 0 }]} />
+      <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
+        {sch ? <LinkButton title={t.history} icon={CalendarDays} onPress={onHistory} /> : <View />}
+        <LinkButton title={t.unsubscribe} icon={UserMinus} color={C.textSoft} onPress={onRemove} />
+      </View>
+    </Card>
+  );
+}
+
+const st = themedStyles(() => ({
+  topBar: { flexDirection: "row", alignItems: "center", gap: 10, marginTop: 6, marginBottom: 4 },
+  logo: { width: 38, height: 38, borderRadius: 12, alignItems: "center", justifyContent: "center" },
+  hero: { borderRadius: R.xl, padding: 22, marginTop: 16, overflow: "hidden" },
+  heroBubble: { position: "absolute", width: 180, height: 180, borderRadius: 90, backgroundColor: C.white, opacity: 0.1, right: -50, top: -70 },
+  notice: { flexDirection: "row", gap: 12, alignItems: "flex-start", borderRadius: R.lg, padding: 14, marginTop: 14 },
+  iconDot: { width: 36, height: 36, borderRadius: 18, alignItems: "center", justifyContent: "center" },
+  pid: { ...F.extrabold, fontSize: 34, color: C.text, letterSpacing: 5 },
+  divider: { height: 1, backgroundColor: C.border, marginVertical: 14 },
+  avatar: { width: 46, height: 46, borderRadius: 23, alignItems: "center", justifyContent: "center" },
+}));

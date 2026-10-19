@@ -1,18 +1,26 @@
 // Blister Buddy notifier: a cron-only Cloudflare Worker (no HTTP endpoint).
 // Every minute it
-//   1. sends due daily reminders (users/{pid}.nextReminderAt <= now) to the owner and subscribers,
-//   2. tells subscribers when a pill was marked taken (users/{pid}.takenPending == true).
-// Data lives in Firestore (Firebase Spark plan); pushes go out via the FCM HTTP v1 API.
+//   1. sends due reminders (users/{pid}.nextReminderAt <= now): the owner gets the reminder and its
+//      repeats (with a "Taken" button), followers the first one,
+//   2. tells followers when a pill is still not taken (nextLateAt <= now),
+//   3. tells followers when today's pill was marked taken (takenPending == true),
+//   4. sends the owner's refill and appointment notices (nextNoticeAt <= now).
+// The app computes nextReminderAt/nextLateAt on every change with the same shared/schedule.ts;
+// the worker advances them after each send. Pushes go out as data-only FCM messages, which the
+// Android app (expo-notifications) and the web service worker turn into notifications.
+
+import {
+  addDays, dayKey, lateTime, nextLateAt, nextNoticeAt, nextReminderAt, noticesAt, reminderTimes, type Plan,
+} from "../../shared/schedule";
 
 export interface Env {
   FIREBASE_PROJECT_ID: string;
-  APP_URL: string;
   SERVICE_ACCOUNT_JSON: string;
 }
 
 type Value = {
   stringValue?: string; integerValue?: string; booleanValue?: boolean; timestampValue?: string;
-  nullValue?: null; arrayValue?: { values?: Value[] };
+  nullValue?: null; arrayValue?: { values?: Value[] }; mapValue?: { fields?: Record<string, Value> };
 };
 type Doc = { name: string; fields?: Record<string, Value>; updateTime: string };
 
@@ -121,45 +129,22 @@ class Firestore {
 
 const str = (d: Doc, f: string) => d.fields?.[f]?.stringValue ?? "";
 const int = (d: Doc, f: string) => Number(d.fields?.[f]?.integerValue ?? 0);
+const millis = (d: Doc, f: string) => Date.parse(d.fields![f].timestampValue!);
 /** Last path segment of a doc name: the pid for users/{pid}, the uid for accounts/{uid}. */
 const pidOf = (d: Doc) => d.name.split("/").pop()!;
 const ts = (ms: number | null): Value => (ms === null ? { nullValue: null } : { timestampValue: new Date(ms).toISOString() });
 
-// ---------- Time zones (no libraries in Workers; Intl does the work) ----------
-
-function zonedParts(at: number, tz: string) {
-  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", {
-    timeZone: tz, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit",
-  }).formatToParts(new Date(at)).map((p) => [p.type, Number(p.value)]));
-  return parts as Record<"year" | "month" | "day" | "hour" | "minute" | "second", number>;
-}
-
-const dayKey = (at: number, tz: string) => {
-  const p = zonedParts(at, tz);
-  return `${p.year}-${String(p.month).padStart(2, "0")}-${String(p.day).padStart(2, "0")}`;
-};
-
-/** UTC ms for a wall-clock time in tz (day may overflow; Date.UTC normalizes it). */
-function zonedToUtc(year: number, month: number, day: number, hour: number, minute: number, tz: string) {
-  const guess = Date.UTC(year, month - 1, day, hour, minute);
-  const offset = (at: number) => {
-    const p = zonedParts(at, tz);
-    return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - Math.floor(at / 1000) * 1000;
+function planOf(d: Doc): Plan {
+  const taken = d.fields?.takenDays?.mapValue?.fields ?? {};
+  return {
+    pillsPerPack: int(d, "pillsPerPack"), placebo: int(d, "placebo"), breakDays: int(d, "breakDays"),
+    packStart: str(d, "packStart"), trackingSince: str(d, "trackingSince"), time: str(d, "time"), tz: str(d, "tz"),
+    repeatMinutes: int(d, "repeatMinutes"), lateMinutes: int(d, "lateMinutes"),
+    takenDays: Object.fromEntries(Object.entries(taken).map(([day, v]) => [day, v.stringValue ?? ""])),
+    earlierPackStarts: (d.fields?.earlierPackStarts?.arrayValue?.values ?? []).map((v) => v.stringValue!),
+    supplyPacks: int(d, "supplyPacks"), supplyFrom: str(d, "supplyFrom") || undefined,
+    appointmentDay: str(d, "appointmentDay") || null,
   };
-  const first = guess - offset(guess);
-  return guess - offset(first); // second pass settles DST boundaries
-}
-
-/** First occurrence of "HH:MM" in tz strictly after `after`. */
-export function nextOccurrence(time: string, tz: string, after: number) {
-  const [h, m] = time.split(":").map(Number);
-  const p = zonedParts(after, tz);
-  for (let k = 0; k < 3; k++) {
-    const t = zonedToUtc(p.year, p.month, p.day + k, h, m, tz);
-    if (t > after) return t;
-  }
-  return after + 24 * 3600 * 1000;
 }
 
 // ---------- FCM ----------
@@ -169,39 +154,50 @@ type Text = { title: string; body: string };
 const TEXT = {
   en: {
     ownerReminder: (): Text => ({ title: "💊 Pill time", body: "Time to take today’s pill." }),
+    ownerRepeat: (): Text => ({ title: "💊 Still not taken", body: "Don’t forget today’s pill." }),
     subscriberReminder: (name: string): Text => ({ title: "💊 Pill time", body: `${name} should take today’s pill now.` }),
-    taken: (name: string, taken: number, total: number): Text => ({ title: "✅ Pill taken", body: `${name} took today’s pill (${taken}/${total}).` }),
+    late: (name: string): Text => ({ title: "⏰ Not taken yet", body: `${name} hasn’t marked today’s pill as taken yet.` }),
+    taken: (name: string, time: string): Text => ({ title: "✅ Pill taken", body: `${name} took today’s pill at ${time}.` }),
+    refill: (): Text => ({ title: "📦 Last pack started", body: "Time to get a refill of your pill." }),
+    appointment: (note: string): Text => ({ title: "🩺 Doctor’s appointment tomorrow", body: note || "Don’t forget your appointment tomorrow." }),
+    takenButton: "Taken ✓",
   },
   de: {
     ownerReminder: (): Text => ({ title: "💊 Pillenzeit", body: "Zeit für die heutige Pille." }),
+    ownerRepeat: (): Text => ({ title: "💊 Noch nicht genommen", body: "Vergiss die heutige Pille nicht." }),
     subscriberReminder: (name: string): Text => ({ title: "💊 Pillenzeit", body: `${name} sollte jetzt die heutige Pille nehmen.` }),
-    taken: (name: string, taken: number, total: number): Text => ({ title: "✅ Pille genommen", body: `${name} hat die heutige Pille genommen (${taken}/${total}).` }),
+    late: (name: string): Text => ({ title: "⏰ Noch nicht genommen", body: `${name} hat die heutige Pille noch nicht als genommen markiert.` }),
+    taken: (name: string, time: string): Text => ({ title: "✅ Pille genommen", body: `${name} hat die heutige Pille um ${time} genommen.` }),
+    refill: (): Text => ({ title: "📦 Letzter Blister angebrochen", body: "Zeit, die Pille nachzukaufen." }),
+    appointment: (note: string): Text => ({ title: "🩺 Arzttermin morgen", body: note || "Denk an deinen Termin morgen." }),
+    takenButton: "Genommen ✓",
   },
 } satisfies Record<Lang, unknown>;
 type Texts = (typeof TEXT)["en"];
 
+/** With `takenAction`, the notification gets a "Taken" button that marks the pill of `day`. */
+type Push = { text: (t: Texts) => Text; tag: string; takenAction?: { pid: string; day: string } };
+
 /** Sends to every device of the given accounts, each in its account's language. Returns the number delivered. */
-async function sendAll(env: Env, fs: Firestore, uids: string[], text: (t: Texts) => Text, tag: string) {
+async function sendAll(env: Env, fs: Firestore, uids: string[], push: Push) {
   const targets = await fs.devices(uids);
   let sent = 0;
   await Promise.all(targets.map(async ({ uid, token, lang }) => {
+    const { title, body } = push.text(TEXT[lang]);
+    // Data-only: expo-notifications (Android) and the web service worker build the notification from these keys.
+    const data: Record<string, string> = { title, message: body, tag: push.tag, channelId: "default", body: JSON.stringify(push.takenAction ?? {}) };
+    if (push.takenAction) Object.assign(data, { categoryId: "reminder", actionTitle: TEXT[lang].takenButton });
     const res = await fetch(`https://fcm.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/messages:send`, {
       method: "POST",
       headers: { Authorization: `Bearer ${fs.token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ message: {
-        token,
-        notification: text(TEXT[lang]),
-        data: { tag },
-        android: { priority: "HIGH", notification: { channel_id: "default", tag } },
-        webpush: { headers: { Urgency: "high" }, fcm_options: { link: env.APP_URL } },
-      } }),
+      body: JSON.stringify({ message: { token, data, android: { priority: "HIGH" }, webpush: { headers: { Urgency: "high" } } } }),
     });
     if (res.ok) { sent++; return; }
-    const body = await res.text();
-    if (res.status === 404 || body.includes("UNREGISTERED") || body.includes("registration token is not a valid")) {
+    const text = await res.text();
+    if (res.status === 404 || text.includes("UNREGISTERED") || text.includes("registration token is not a valid")) {
       await fs.removeToken(uid, token); // app uninstalled or token rotated
     } else {
-      console.error(`FCM send failed (${res.status}): ${body}`);
+      console.error(`FCM send failed (${res.status}): ${text}`);
     }
   }));
   return sent;
@@ -220,32 +216,73 @@ async function forEachDoc(job: string, docs: Doc[], fn: (doc: Doc, pid: string) 
 async function sendReminders(env: Env, fs: Firestore, now: number) {
   const due = await fs.query("nextReminderAt", "LESS_THAN_OR_EQUAL", ts(now));
   await forEachDoc("reminder", due, async (doc, pid) => {
-    const tz = str(doc, "tz");
-    const dueAt = Date.parse(doc.fields!.nextReminderAt.timestampValue!);
-    const finished = int(doc, "taken") >= int(doc, "pillsPerPack");
-    const alreadyTaken = str(doc, "lastTakenDay") === dayKey(dueAt, tz);
-
-    // Claim the reminder first so a failure can never cause duplicate notifications.
-    const next = finished ? null : nextOccurrence(str(doc, "time"), tz, now);
-    if (!(await fs.patchIfUnchanged(doc, { nextReminderAt: ts(next) }))) return;
-    if (finished || alreadyTaken || now - dueAt > MAX_LATE_MS) return;
+    const plan = planOf(doc);
+    const dueAt = millis(doc, "nextReminderAt");
+    const day = dayKey(dueAt, plan.tz);
+    // Claim it first so a failure can never cause duplicate notifications.
+    if (!(await fs.patchIfUnchanged(doc, { nextReminderAt: ts(nextReminderAt(plan, now)) }))) return;
+    // Not one of today's reminder moments any more (taken meanwhile) or too old after an outage.
+    const index = reminderTimes(plan, day).indexOf(dueAt);
+    if (index < 0 || now - dueAt > MAX_LATE_MS) return;
 
     const name = str(doc, "name") || pid;
-    const subs = await fs.subscriberUids(pid);
-    const a = await sendAll(env, fs, [str(doc, "ownerUid")], (t) => t.ownerReminder(), `reminder-${pid}`);
-    const b = await sendAll(env, fs, subs, (t) => t.subscriberReminder(name), `reminder-${pid}`);
-    console.log(`reminder ${pid}: ${a + b} notifications`);
+    // The owner may replace the reminder wording (e.g. something discreet); it then becomes the title.
+    const custom = str(doc, "reminderText");
+    const owner = sendAll(env, fs, [str(doc, "ownerUid")], {
+      text: (t) => (custom ? { title: custom, body: "" } : index === 0 ? t.ownerReminder() : t.ownerRepeat()),
+      tag: `reminder-${pid}`, takenAction: { pid, day },
+    });
+    // Followers only get the first reminder; repeats are for the owner.
+    const followers = index === 0
+      ? sendAll(env, fs, await fs.subscriberUids(pid), { text: (t) => t.subscriberReminder(name), tag: `reminder-${pid}` })
+      : 0;
+    console.log(`reminder ${pid} #${index}: ${(await owner) + (await followers)} notifications`);
   });
 }
 
-async function sendTakenUpdates(env: Env, fs: Firestore) {
+async function sendLateAlerts(env: Env, fs: Firestore, now: number) {
+  const due = await fs.query("nextLateAt", "LESS_THAN_OR_EQUAL", ts(now));
+  await forEachDoc("late", due, async (doc, pid) => {
+    const plan = planOf(doc);
+    const dueAt = millis(doc, "nextLateAt");
+    if (!(await fs.patchIfUnchanged(doc, { nextLateAt: ts(nextLateAt(plan, now)) }))) return;
+    // The alert belongs to the pill day it falls on or (late evening + delay) the day before.
+    const today = dayKey(dueAt, plan.tz);
+    const still = [today, addDays(today, -1)].some((d) => lateTime(plan, d) === dueAt);
+    if (!still || now - dueAt > MAX_LATE_MS) return;
+    const name = str(doc, "name") || pid;
+    const sent = await sendAll(env, fs, await fs.subscriberUids(pid), { text: (t) => t.late(name), tag: `late-${pid}` });
+    console.log(`late ${pid}: ${sent} notifications`);
+  });
+}
+
+async function sendTakenUpdates(env: Env, fs: Firestore, now: number) {
   const pending = await fs.query("takenPending", "EQUAL", { booleanValue: true });
   await forEachDoc("taken", pending, async (doc, pid) => {
     if (!(await fs.patchIfUnchanged(doc, { takenPending: { booleanValue: false } }))) return;
+    const plan = planOf(doc);
+    const time = plan.takenDays[dayKey(now, plan.tz)];
+    if (!time) return; // unmarked again before we got to it
     const name = str(doc, "name") || pid;
-    const subs = await fs.subscriberUids(pid);
-    const sent = await sendAll(env, fs, subs, (t) => t.taken(name, int(doc, "taken"), int(doc, "pillsPerPack")), `taken-${pid}`);
+    const sent = await sendAll(env, fs, await fs.subscriberUids(pid), { text: (t) => t.taken(name, time), tag: `taken-${pid}` });
     console.log(`taken ${pid}: ${sent} notifications`);
+  });
+}
+
+async function sendNotices(env: Env, fs: Firestore, now: number) {
+  const due = await fs.query("nextNoticeAt", "LESS_THAN_OR_EQUAL", ts(now));
+  await forEachDoc("notice", due, async (doc, pid) => {
+    const plan = planOf(doc);
+    const dueAt = millis(doc, "nextNoticeAt");
+    if (!(await fs.patchIfUnchanged(doc, { nextNoticeAt: ts(nextNoticeAt(plan, now)) }))) return;
+    if (now - dueAt > MAX_LATE_MS) return;
+    const note = str(doc, "appointmentNote");
+    for (const kind of noticesAt(plan, dueAt)) {
+      const sent = await sendAll(env, fs, [str(doc, "ownerUid")], {
+        text: (t) => (kind === "refill" ? t.refill() : t.appointment(note)), tag: `${kind}-${pid}`,
+      });
+      console.log(`${kind} ${pid}: ${sent} notifications`);
+    }
   });
 }
 
@@ -253,7 +290,10 @@ export default {
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
     const fs = new Firestore(env, await accessToken(env));
     const now = Date.now();
-    // Sequential: both jobs may patch the same doc with an updateTime precondition.
-    ctx.waitUntil(sendTakenUpdates(env, fs).then(() => sendReminders(env, fs, now)));
+    // Sequential: the jobs may patch the same doc with an updateTime precondition.
+    ctx.waitUntil(sendTakenUpdates(env, fs, now)
+      .then(() => sendReminders(env, fs, now))
+      .then(() => sendLateAlerts(env, fs, now))
+      .then(() => sendNotices(env, fs, now)));
   },
 } satisfies ExportedHandler<Env>;

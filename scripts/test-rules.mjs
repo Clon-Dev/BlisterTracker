@@ -4,7 +4,7 @@
 import { createHash } from "node:crypto";
 import { initializeApp, deleteApp } from "firebase/app";
 import { getAuth, deleteUser, createUserWithEmailAndPassword } from "firebase/auth";
-import { getFirestore, doc, setDoc, getDoc, updateDoc, deleteDoc, collection, getDocs, Timestamp, terminate, writeBatch } from "firebase/firestore";
+import { getFirestore, doc, setDoc, getDoc, updateDoc, deleteDoc, deleteField, collection, getDocs, Timestamp, terminate, writeBatch } from "firebase/firestore";
 
 const config = {
   apiKey: process.env.EXPO_PUBLIC_FIREBASE_API_KEY,
@@ -36,8 +36,9 @@ const alice = await client("alice");
 const bob = await client("bob");
 const A = randomPid(), B = randomPid();
 const schedule = {
-  ownerUid: alice.user.uid, name: "Test", pillsPerPack: 21, taken: 3, time: "20:00", tz: "Europe/Berlin",
-  lastTakenDay: null, nextReminderAt: Timestamp.fromMillis(Date.now() + 864e5), takenPending: false,
+  ownerUid: alice.user.uid, name: "Test", pillsPerPack: 21, placebo: 0, breakDays: 7, packStart: "2026-10-15",
+  trackingSince: "2026-10-15", time: "20:00", tz: "Europe/Berlin", repeatMinutes: 30, lateMinutes: 60,
+  takenDays: { "2026-10-15": "20:01" }, nextReminderAt: Timestamp.fromMillis(Date.now() + 864e5), nextLateAt: null, takenPending: false,
 };
 
 try {
@@ -51,10 +52,23 @@ try {
   await expect("bob cannot set an unknown language", false, () => updateDoc(doc(bob.db, "accounts", bob.user.uid), { lang: "xx" }));
   await expect("bob cannot read alice's account", false, () => getDoc(doc(bob.db, "accounts", alice.user.uid)));
   await expect("alice saves a valid schedule", true, () => setDoc(doc(alice.db, "users", A), schedule));
-  await expect("alice cannot save taken > pillsPerPack", false, () => updateDoc(doc(alice.db, "users", A), { taken: 22 }));
+  await expect("alice cannot have more placebo pills than pills", false, () => updateDoc(doc(alice.db, "users", A), { placebo: 21 }));
+  await expect("alice cannot use an unsupported repeat interval", false, () => updateDoc(doc(alice.db, "users", A), { repeatMinutes: 5 }));
+  await expect("alice cannot save a malformed pack start", false, () => updateDoc(doc(alice.db, "users", A), { packStart: "15.10.2026" }));
+  await expect("alice switches to 24 + 4 placebo with 2 h follower alert", true, () => updateDoc(doc(alice.db, "users", A), { pillsPerPack: 28, placebo: 4, breakDays: 0, lateMinutes: 120 }));
   await expect("alice cannot save a bad time", false, () => updateDoc(doc(alice.db, "users", A), { time: "25:00" }));
   await expect("alice cannot add unknown fields", false, () => updateDoc(doc(alice.db, "users", A), { evil: true }));
-  await expect("alice marks a pill taken", true, () => updateDoc(doc(alice.db, "users", A), { taken: 4, lastTakenDay: "2026-10-19", takenPending: true }));
+  await expect("alice saves supply, appointment, early start and reminder text", true, () => updateDoc(doc(alice.db, "users", A), {
+    supplyPacks: 3, supplyFrom: "2026-10-15", appointmentDay: "2026-11-03", appointmentNote: "Dr. Weber 9:30",
+    earlierPackStarts: ["2026-09-17"], reminderText: "🌸 Little reminder ✨", nextNoticeAt: Timestamp.fromMillis(Date.now() + 864e5),
+  }));
+  await expect("alice cannot track more than 24 packs", false, () => updateDoc(doc(alice.db, "users", A), { supplyPacks: 30 }));
+  await expect("alice cannot save an overlong reminder text", false, () => updateDoc(doc(alice.db, "users", A), { reminderText: "x".repeat(300) }));
+  await expect("alice writes a shared note", true, () => setDoc(doc(alice.db, "users", A, "notes", "shared"), { days: { "2026-10-19": { text: "fine", mood: "🙂" } } }));
+  await expect("alice writes a private note", true, () => setDoc(doc(alice.db, "users", A, "notes", "private"), { days: { "2026-10-18": { text: "cramps", mood: "😣" } } }));
+  await expect("bob cannot read alice's shared notes before following", false, () => getDoc(doc(bob.db, "users", A, "notes", "shared")));
+  await expect("alice marks a pill taken", true, () => updateDoc(doc(alice.db, "users", A), { "takenDays.2026-10-19": "20:41", takenPending: true }));
+  await expect("alice corrects (unmarks) an earlier day", true, () => updateDoc(doc(alice.db, "users", A), { "takenDays.2026-10-15": deleteField() }));
   await expect("bob cannot read alice's schedule before subscribing", false, () => getDoc(doc(bob.db, "users", A)));
   await expect("bob cannot subscribe before a password is set", false, () => setDoc(doc(bob.db, "users", A, "subscribers", bob.user.uid), { key: key(A, "secret1") }));
   await expect("alice sets her password", true, () => setDoc(doc(alice.db, "users", A, "private", "auth"), { key: key(A, "secret1") }));
@@ -64,9 +78,15 @@ try {
   await expect("bob subscribes with ID + password", true, () => setDoc(doc(bob.db, "users", A, "subscribers", bob.user.uid), { key: key(A, "secret1") }));
   await expect("bob can now read alice's schedule", true, async () => {
     const s = await getDoc(doc(bob.db, "users", A));
-    if (s.data().taken !== 4) throw new Error("unexpected data");
+    if (s.data().takenDays["2026-10-19"] !== "20:41") throw new Error("unexpected data");
   });
-  await expect("bob cannot modify alice's schedule", false, () => updateDoc(doc(bob.db, "users", A), { taken: 0 }));
+  await expect("bob (follower) reads alice's shared notes", true, async () => {
+    const n = await getDoc(doc(bob.db, "users", A, "notes", "shared"));
+    if (n.data().days["2026-10-19"].text !== "fine") throw new Error("unexpected");
+  });
+  await expect("bob cannot read alice's private notes", false, () => getDoc(doc(bob.db, "users", A, "notes", "private")));
+  await expect("bob cannot write alice's notes", false, () => setDoc(doc(bob.db, "users", A, "notes", "shared"), { days: {} }));
+  await expect("bob cannot modify alice's schedule", false, () => updateDoc(doc(bob.db, "users", A), { "takenDays.2026-10-20": "08:00" }));
   await expect("bob cannot list alice's subscribers", false, () => getDocs(collection(bob.db, "users", A, "subscribers")));
   await expect("alice can list her subscribers", true, () => getDocs(collection(alice.db, "users", A, "subscribers")));
   await expect("alice cannot subscribe to herself", false, async () => {
@@ -80,6 +100,8 @@ try {
     const batch = writeBatch(alice.db);
     (await getDocs(collection(alice.db, "users", A, "subscribers"))).forEach((d) => batch.delete(d.ref));
     batch.delete(doc(alice.db, "users", A, "private", "auth"));
+    batch.delete(doc(alice.db, "users", A, "notes", "shared"));
+    batch.delete(doc(alice.db, "users", A, "notes", "private"));
     batch.delete(doc(alice.db, "users", A));
     batch.delete(doc(alice.db, "accounts", alice.user.uid));
     await batch.commit();

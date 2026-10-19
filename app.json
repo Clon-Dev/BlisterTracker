@@ -34,7 +34,8 @@
           "defaultChannel": "default"
         }
       ],
-      "expo-localization"
+      "expo-localization",
+      "expo-font"
     ],
     "extra": {
       "eas": {

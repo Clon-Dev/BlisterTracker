@@ -25,3 +25,24 @@ export async function enablePush(): Promise<string | null> {
   const token = await Notifications.getDevicePushTokenAsync();
   return String(token.data);
 }
+
+/** The "Taken" button on the owner's reminder (category "reminder" in the worker's messages). */
+export async function registerTakenAction(buttonTitle: string) {
+  await Notifications.setNotificationCategoryAsync("reminder", [
+    { identifier: "taken", buttonTitle, options: { opensAppToForeground: true } },
+  ]);
+}
+
+/** Calls `cb(pid, day)` when the "Taken" button was pressed, including when it launched the app. */
+export function onTakenAction(cb: (pid: string, day: string) => void) {
+  const handle = (response: Notifications.NotificationResponse | null) => {
+    if (response?.actionIdentifier !== "taken") return;
+    Notifications.clearLastNotificationResponse(); // don't re-apply it on the next launch
+    Notifications.dismissNotificationAsync(response.notification.request.identifier);
+    const { pid, day } = response.notification.request.content.data as { pid: string; day: string };
+    cb(pid, day);
+  };
+  handle(Notifications.getLastNotificationResponse());
+  const sub = Notifications.addNotificationResponseReceivedListener(handle);
+  return () => sub.remove();
+}

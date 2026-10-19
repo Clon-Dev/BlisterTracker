@@ -5,7 +5,6 @@ workers_dev = false
 
 [vars]
 FIREBASE_PROJECT_ID = "blisterbuddy-8e7a4"
-APP_URL = "https://blisterbuddy-8e7a4.web.app"
 
 # Secret (set with `npx wrangler secret put SERVICE_ACCOUNT_JSON`):
 #   SERVICE_ACCOUNT_JSON  Firebase Admin SDK service-account key (JSON)
