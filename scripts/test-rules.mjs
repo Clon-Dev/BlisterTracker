@@ -38,7 +38,7 @@ const A = randomPid(), B = randomPid();
 const schedule = {
   ownerUid: alice.user.uid, name: "Test", pillsPerPack: 21, placebo: 0, breakDays: 7, packStart: "2026-10-15",
   trackingSince: "2026-10-15", time: "20:00", tz: "Europe/Berlin", repeatMinutes: 30, lateMinutes: 60,
-  takenDays: { "2026-10-15": "20:01" }, nextReminderAt: Timestamp.fromMillis(Date.now() + 864e5), nextLateAt: null, takenPending: false,
+  takenDays: { "2026-10-15": "20:01" }, nextReminderAt: Timestamp.fromMillis(Date.now() + 864e5), nextLateAt: null, takenPending: false, shareKeyWrap: "salt|v1:abc",
 };
 
 try {
@@ -50,6 +50,9 @@ try {
   await expect("bob creates his account", true, () => setDoc(doc(bob.db, "accounts", bob.user.uid), { pid: B, subs: [], tokens: [] }));
   await expect("bob sets his notification language", true, () => updateDoc(doc(bob.db, "accounts", bob.user.uid), { lang: "de" }));
   await expect("bob cannot set an unknown language", false, () => updateDoc(doc(bob.db, "accounts", bob.user.uid), { lang: "xx" }));
+  await expect("alice stores her encryption keyring", true, () => updateDoc(doc(alice.db, "accounts", alice.user.uid), { keyring: { v: 1, pwSalt: "s", pw: "v1:x", rcSalt: "r", rc: "v1:y" } }));
+  await expect("alice adds a share-key wrap before having a schedule", true, () => updateDoc(doc(alice.db, "users", A), { shareKeyWrap: "salt|v1:abc" }));
+  await expect("alice cannot add other fields to a schedule-less profile", false, () => updateDoc(doc(alice.db, "users", A), { evil: true }));
   await expect("bob cannot read alice's account", false, () => getDoc(doc(bob.db, "accounts", alice.user.uid)));
   await expect("alice saves a valid schedule", true, () => setDoc(doc(alice.db, "users", A), schedule));
   await expect("alice cannot have more placebo pills than pills", false, () => updateDoc(doc(alice.db, "users", A), { placebo: 21 }));
@@ -72,6 +75,10 @@ try {
   await expect("bob cannot read alice's schedule before subscribing", false, () => getDoc(doc(bob.db, "users", A)));
   await expect("bob cannot subscribe before a password is set", false, () => setDoc(doc(bob.db, "users", A, "subscribers", bob.user.uid), { key: key(A, "secret1") }));
   await expect("alice sets her password", true, () => setDoc(doc(alice.db, "users", A, "private", "auth"), { key: key(A, "secret1") }));
+  await expect("alice stores her (encrypted) sharing password for herself", true, () => setDoc(doc(alice.db, "users", A, "private", "auth"), { key: key(A, "secret1"), password: "v1:" + "A".repeat(80) }));
+  await expect("alice can read her stored password", true, async () => {
+    if (!(await getDoc(doc(alice.db, "users", A, "private", "auth"))).data().password.startsWith("v1:")) throw new Error("not stored");
+  });
   await expect("bob cannot read alice's password hash", false, () => getDoc(doc(bob.db, "users", A, "private", "auth")));
   await expect("bob cannot subscribe with the wrong password", false, () => setDoc(doc(bob.db, "users", A, "subscribers", bob.user.uid), { key: key(A, "wrong!!") }));
   await expect("bob cannot subscribe someone else", false, () => setDoc(doc(bob.db, "users", A, "subscribers", "someone-else"), { key: key(A, "secret1") }));
@@ -83,6 +90,9 @@ try {
   await expect("bob (follower) reads alice's shared notes", true, async () => {
     const n = await getDoc(doc(bob.db, "users", A, "notes", "shared"));
     if (n.data().days["2026-10-19"].text !== "fine") throw new Error("unexpected");
+  });
+  await expect("bob (follower) can read alice's share-key wrap", true, async () => {
+    if (!(await getDoc(doc(bob.db, "users", A))).data().shareKeyWrap) throw new Error("missing");
   });
   await expect("bob cannot read alice's private notes", false, () => getDoc(doc(bob.db, "users", A, "notes", "private")));
   await expect("bob cannot write alice's notes", false, () => setDoc(doc(bob.db, "users", A, "notes", "shared"), { days: {} }));

@@ -13,6 +13,10 @@ export function DatePicker({ value, onChange, min }: { value: string | null; onC
   const [month, setMonth] = useState({ year: +start.slice(0, 4), month: +start.slice(5, 7) - 1 });
   const first = `${month.year}-${String(month.month + 1).padStart(2, "0")}-01`;
   const days = Array.from({ length: 31 }, (_, i) => addDays(first, i)).filter((d) => d.slice(0, 7) === first.slice(0, 7));
+  // Fixed weeks of 7 (wrapping 1/7-wide cells can round into 6 per row and shift the weekdays).
+  const cells: (string | null)[] = [...Array(weekday(first)).fill(null), ...days];
+  while (cells.length % 7) cells.push(null);
+  const weeks = Array.from({ length: cells.length / 7 }, (_, w) => cells.slice(w * 7, w * 7 + 7));
   const shift = (n: number) => setMonth(({ year, month: m }) => {
     const d = new Date(Date.UTC(year, m + n, 1));
     return { year: d.getUTCFullYear(), month: d.getUTCMonth() };
@@ -27,9 +31,10 @@ export function DatePicker({ value, onChange, min }: { value: string | null; onC
       <View style={{ flexDirection: "row", marginTop: 10 }}>
         {t.weekdays.map((w) => <Text key={w} style={[s.small, F.bold, st.col, { textAlign: "center", color: C.muted }]}>{w}</Text>)}
       </View>
-      <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
-        {Array.from({ length: weekday(first) }, (_, i) => <View key={`pad${i}`} style={st.col} />)}
-        {days.map((day) => {
+      {weeks.map((week, w) => (
+      <View key={w} style={{ flexDirection: "row" }}>
+        {week.map((day, i) => {
+          if (!day) return <View key={`pad${i}`} style={st.col} />;
           const disabled = day < min;
           const selected = day === value;
           return (
@@ -42,11 +47,12 @@ export function DatePicker({ value, onChange, min }: { value: string | null; onC
           );
         })}
       </View>
+      ))}
     </View>
   );
 }
 
 const st = themedStyles(() => ({
-  col: { width: `${100 / 7}%` as const },
+  col: { flex: 1 },
   day: { width: 34, height: 34, borderRadius: 17, alignItems: "center" as const, justifyContent: "center" as const },
 }));

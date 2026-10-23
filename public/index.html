@@ -5,7 +5,8 @@
     <meta httpEquiv="X-UA-Compatible" content="IE=edge" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>%WEB_TITLE%</title>
-    <meta name="theme-color" content="#F7F1F4" />
+    <meta name="theme-color" content="#F7F1F4" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#120C10" media="(prefers-color-scheme: dark)" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
@@ -28,12 +29,73 @@
         margin: 0;
         background: #F7F1F4;
       }
+      @media (prefers-color-scheme: dark) {
+        body { background: #120C10; }
+      }
       #root {
         display: flex;
         height: 100%;
         flex: 1;
       }
     </style>
+    <style>
+      /* Start screen in plain HTML: visible before the app's script runs, removed by the app (bbStarted). */
+      #boot { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+        gap: 18px; padding: 24px; background: #F7F1F4; color: #6B5562; font: 15px/1.45 system-ui, -apple-system, sans-serif; text-align: center; }
+      #boot img { width: 72px; height: 72px; border-radius: 18px; }
+      #boot .spin { width: 26px; height: 26px; border: 3px solid #E9D3DE; border-top-color: #D4567D; border-radius: 50%; animation: bbspin 0.9s linear infinite; }
+      #boot button { font: inherit; font-weight: 700; color: #fff; background: #D4567D; border: 0; border-radius: 14px; padding: 12px 26px; }
+      #boot .err { font-size: 12px; opacity: 0.8; max-width: 320px; word-break: break-word; }
+      @media (prefers-color-scheme: dark) {
+        #boot { background: #120C10; color: #CDB7C3; }
+        #boot .spin { border-color: #3A2A33; border-top-color: #F07A9C; }
+      }
+      @keyframes bbspin { to { transform: rotate(360deg); } }
+    </style>
+    <script>
+      // A cached page can point at a script that no longer exists after an update. If the app hasn't started
+      // because a script failed to load or run, reload once to fetch the current page. If it still hasn't started
+      // after a while, the start screen says so, shows the error and offers a reload.
+      (function () {
+        var KEY = "bb_reloaded";
+        var started = false, errors = [];
+        var de = /^de\b/i.test(navigator.language || "");
+        function boot() { return document.getElementById("boot"); }
+        window.bbStarted = function () {
+          started = true;
+          var b = boot(); if (b) b.remove();
+          try { sessionStorage.removeItem(KEY); } catch (e) {}
+        };
+        window.addEventListener("error", function (e) {
+          var t = e.target;
+          if (t && t.tagName && t.tagName !== "SCRIPT") return; // a failed image or style is no reason to reload
+          errors.push(t && t.src ? "Script failed to load: " + t.src.split("/").pop() : e.message || "Error");
+          recover();
+        }, true);
+        window.addEventListener("unhandledrejection", function (e) {
+          if (!started) errors.push(String((e.reason && e.reason.message) || e.reason));
+        });
+        function recover() {
+          if (started) return;
+          try { if (sessionStorage.getItem(KEY)) return; sessionStorage.setItem(KEY, "1"); } catch (e) { return; }
+          location.reload();
+        }
+        setTimeout(function () {
+          var b = boot();
+          if (started || !b) return;
+          b.querySelector(".spin").remove();
+          var msg = document.createElement("div");
+          msg.textContent = de ? "Blister Buddy startet nicht." : "Blister Buddy isn’t starting.";
+          var err = document.createElement("div");
+          err.className = "err";
+          err.textContent = errors.length ? errors.slice(0, 3).join(" · ") : (de ? "Kein Fehler gemeldet." : "No error reported.");
+          var btn = document.createElement("button");
+          btn.textContent = de ? "Neu laden" : "Reload";
+          btn.onclick = function () { location.reload(); };
+          b.append(msg, err, btn);
+        }, 10000);
+      })();
+    </script>
   </head>
 
   <body>
@@ -41,5 +103,6 @@
     <noscript> You need to enable JavaScript to run this app. </noscript>
     <!-- The root element for your Expo app. -->
     <div id="root"></div>
+    <div id="boot"><img src="/icon-192.png" alt="" /><div class="spin"></div></div>
   </body>
 </html>

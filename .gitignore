@@ -9,5 +9,5 @@ firebase-debug.log
 google-services.json
 GoogleService-Info.plist
 .env
-# Released APKs (published to Firebase Hosting by scripts/release-android.mjs)
+# Release manifest written by scripts/release-android.mjs
 public/android/

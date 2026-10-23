@@ -40,6 +40,44 @@ Owners track their blister pack; subscribers (ID + password) get notified when t
 
 Why a Worker? Spark can't run Cloud Functions, and sending FCM needs a server holding the service-account key. The Cloudflare Workers free plan includes cron triggers.
 
+## Web hosting and stale pages
+
+Firebase Hosting has no catch-all rewrite (the app has a single page, `/`), so a script that no longer exists is a 404 instead of `index.html`. `/` and `/index.html` are never cached, while the content-hashed files under `/_expo/` and `/assets/` are cached for a year. `public/index.html` shows a start screen in plain HTML (icon and spinner) until the app calls `bbStarted()`. It reloads itself once if the app script fails to load or run (a stale cached page after an update), and after 10 seconds without a start it shows the error and a reload button. The app waits at most 3 seconds for its fonts and then starts with system fonts, and `ErrorBoundary` shows the error message with a reload button instead of an empty screen.
+
+## Kitten mascot
+
+A small kitten (white, red sweater with a heart) lives on the home screen. Code in `src/mascot/`:
+- `art.tsx`: the drawing, split into parts (tail, legs, body, paws, collar, ears, head, eyes, muzzle) that share one 200×236 box.
+- `Kitten.tsx`: the puppet. Each part sits on its own `Animated.View` with a pivot (`transformOrigin`), so blinking, breathing, the tail, ear twitches, walking and climbing run on the native animation driver.
+- `world.tsx`: where it lives.
+  - Home blocks are wrapped in `<MascotSpot>`, which reports their position and has a "room" (zero height) above them.
+  - When the kitten settles, that room opens and pushes the cards below aside. The kitten and its speech bubble sit in it, on the card's top edge, so they never cover anything and scroll with the page.
+  - On its way somewhere it moves on a layer in front of the cards, or behind them when it sneaks. That layer is clamped to the visible part of the page, so while you scroll it clings to the screen edge, then climbs to a room in view.
+  - It only speaks where the whole bubble fits on screen.
+  - If it ever fails to render, the home screen continues without it.
+- `brain.ts`: pure logic, unit-tested in `scripts/test-mascot.ts`. Decides what it says, by priority:
+  - today's pill reminder (own schedule, after the reminder time; "Later" snoozes 30 min)
+  - a greeting on the first open of the day
+  - "How are you feeling?" once a day without a note, which leads to the note card
+  - one health fact a day, up to 3 on request
+  - It celebrates when today's pill gets marked, and naps after 2 minutes alone.
+- `facts.ts`: the facts in English and German, each with its source (NHS, WHO, gesund.bund.de, familienplanung.de, RKI, OHSU) and a **tag** (a subject slug). The database is meant to keep growing:
+  - [docs/mascot-facts-index.md](docs/mascot-facts-index.md) is a short lookup table of all tags per topic. Read it to see what's covered; no need to read the facts. Near-duplicates are fine.
+  - `node scripts/facts-index.ts` validates the facts (both languages, bubble length, https source, no identical text twice) and regenerates the index and [docs/mascot-facts.md](docs/mascot-facts.md) (the full list for review). `node scripts/facts-index.ts find <word>` searches; `--check` is for CI.
+  - Adding a fact is described at the top of the index. Android apps get new facts with the next release; the web app with the next deploy.
+- `store.ts`: per-device settings (Account → Kitten: show it, health facts) and memory (facts shown, daily counters), in AsyncStorage.
+- Reduced motion (system setting): it sits still.
+
+## End-to-end encryption
+
+Notes (shared and private), the appointment note and the owner's stored sharing password are encrypted on the device: AES-256-GCM, `v1:` format in `src/crypto.ts`, with `@noble` libraries that work the same in Hermes and browsers. Neither Google nor anyone holding the service-account key can read them.
+- **Data key** (per account): wrapped twice in `accounts/{uid}.keyring`: with PBKDF2(account password) and with PBKDF2(recovery code). The recovery code is shown once, at registration or later via Account → "Create a new recovery code". The unlocked key is cached on the device: Android Keystore via `expo-secure-store`, browser storage on the web. A new device unlocks with the login password; a device without a cached key shows the unlock screen once.
+- **Forgot password:** after a reset, the keyring opens only with the recovery code, which re-wraps it for the new password. Without the code, "Start fresh" creates a new key, and old encrypted data becomes unreadable.
+- **Share key** (per schedule): encrypts shared notes. Followers receive it through `users/{pid}.shareKeyWrap` (wrapped with PBKDF2(sharing password)) and keep it in their own keyring. Changing the sharing password re-wraps the same key, so existing followers keep reading.
+- **Following:** a follower presents `accessKeyFor(pid, password)` (PBKDF2). The security rules compare it to `private/auth.key`.
+- **Migration:** at the first unlock after the update, plain-text data from before gets encrypted (`migrateToEncryption`).
+- **Stays readable for the server** (the Worker needs it): taken days and times, pack layout, reminder time and zone, supply, appointment date, the custom reminder text, the schedule name. Push texts to followers also pass through FCM in plain text.
+
 ## One-time setup
 
 1. **Firebase console** (project `blisterbuddy-8e7a4`)
@@ -68,13 +106,12 @@ npm run release:android -- --minor      # minor version, e.g. 1.1.x → 1.2.0
 npm run release:android -- "What's new" # optional notes shown in the update card
 ```
 
-The script bumps `version` and `android.versionCode` in `app.json`, builds the APK on EAS (and waits), checks that the download is an APK, and stores it with `android/latest.json` in `public/android/`. It then deploys Firebase Hosting.
+The script bumps `version` and `android.versionCode` in `app.json`, builds the APK on EAS (and waits), and checks that its download link delivers an APK. It writes `android/latest.json` (version and link) to `public/android/` and deploys Firebase Hosting. The APK itself stays on Expo's servers, because Firebase Hosting's free plan rejects executable files.
 
 Installed apps check `latest.json` on start (at most every 6 hours), or via Account → "Check for updates". When a higher `versionCode` is available, the app shows "Version x is available · Update app": it downloads the APK with progress and opens the Android installer. Because every build is signed with the same EAS key, the update installs in place and keeps the login and all app data. The first time, Android asks to allow installs from Blister Buddy.
 
 Notes:
-- `public/android/` is gitignored and excluded from EAS uploads, since the APK is about 70 MB. Firebase Hosting serves only the latest APK.
-- Run web deploys from the machine that holds `public/android/`. A deploy without it would remove the hosted APK.
+- Expo doesn't document how long build downloads stay available. If an old link stops working, a new release fixes it.
 - Commit the bumped `app.json` after a release.
 
 ## Development
@@ -85,6 +122,8 @@ npm run web          # http://localhost:8081
 npm run typecheck
 node --env-file=.env scripts/test-rules.mjs   # live security-rules test (creates & deletes throwaway @example.com users)
 node scripts/test-schedule.ts                 # unit tests for shared/schedule.ts (packs, breaks, DST, repeats, late alerts)
+node scripts/test-mascot.ts                   # unit tests for the kitten's logic (src/mascot/brain.ts)
+node scripts/facts-index.ts --check          # validates the kitten's facts and checks the generated fact docs are current
 cd worker && npm run dev                      # local worker; trigger with curl "http://localhost:8787/__scheduled"
                                               # needs worker/.dev.vars: SERVICE_ACCOUNT_JSON='<json on one line>' 
 ```

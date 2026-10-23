@@ -9,12 +9,26 @@ import { strings, type Lang } from "./i18n";
 /** Auth emails (verification, password reset, email change) are sent in the app language. */
 export const setAuthLanguage = (lang: Lang) => { auth.languageCode = lang; };
 
+/**
+ * The password of the login that just happened, kept in memory only until the app has used it to open
+ * (or create) the encryption keyring. Saves asking for it a second time.
+ */
+let pendingPassword: string | null = null;
+export const takePendingPassword = () => { const p = pendingPassword; pendingPassword = null; return p; };
+
 export async function register(email: string, password: string) {
+  pendingPassword = password;
   const { user } = await createUserWithEmailAndPassword(auth, email.trim(), password);
   await sendEmailVerification(user);
 }
 
-export const login = (email: string, password: string) => signInWithEmailAndPassword(auth, email.trim(), password);
+export async function login(email: string, password: string) {
+  pendingPassword = password;
+  await signInWithEmailAndPassword(auth, email.trim(), password);
+}
+
+/** Checks the account password of the signed-in user (to tell a wrong password from one changed elsewhere). */
+export const verifyPassword = (user: User, password: string) => reauthenticate(user, password).then(() => true, () => false);
 export const logout = () => signOut(auth);
 export const resetPassword = (email: string) => sendPasswordResetEmail(auth, email.trim());
 export const resendVerification = (user: User) => sendEmailVerification(user);

@@ -159,7 +159,7 @@ const TEXT = {
     late: (name: string): Text => ({ title: "⏰ Not taken yet", body: `${name} hasn’t marked today’s pill as taken yet.` }),
     taken: (name: string, time: string): Text => ({ title: "✅ Pill taken", body: `${name} took today’s pill at ${time}.` }),
     refill: (): Text => ({ title: "📦 Last pack started", body: "Time to get a refill of your pill." }),
-    appointment: (note: string): Text => ({ title: "🩺 Doctor’s appointment tomorrow", body: note || "Don’t forget your appointment tomorrow." }),
+    appointment: (): Text => ({ title: "🩺 Doctor’s appointment tomorrow", body: "Don’t forget your appointment tomorrow." }),
     takenButton: "Taken ✓",
   },
   de: {
@@ -169,7 +169,7 @@ const TEXT = {
     late: (name: string): Text => ({ title: "⏰ Noch nicht genommen", body: `${name} hat die heutige Pille noch nicht als genommen markiert.` }),
     taken: (name: string, time: string): Text => ({ title: "✅ Pille genommen", body: `${name} hat die heutige Pille um ${time} genommen.` }),
     refill: (): Text => ({ title: "📦 Letzter Blister angebrochen", body: "Zeit, die Pille nachzukaufen." }),
-    appointment: (note: string): Text => ({ title: "🩺 Arzttermin morgen", body: note || "Denk an deinen Termin morgen." }),
+    appointment: (): Text => ({ title: "🩺 Arzttermin morgen", body: "Denk an deinen Termin morgen." }),
     takenButton: "Genommen ✓",
   },
 } satisfies Record<Lang, unknown>;
@@ -276,10 +276,10 @@ async function sendNotices(env: Env, fs: Firestore, now: number) {
     const dueAt = millis(doc, "nextNoticeAt");
     if (!(await fs.patchIfUnchanged(doc, { nextNoticeAt: ts(nextNoticeAt(plan, now)) }))) return;
     if (now - dueAt > MAX_LATE_MS) return;
-    const note = str(doc, "appointmentNote");
+    // The appointment note is end-to-end encrypted, so the push stays generic.
     for (const kind of noticesAt(plan, dueAt)) {
       const sent = await sendAll(env, fs, [str(doc, "ownerUid")], {
-        text: (t) => (kind === "refill" ? t.refill() : t.appointment(note)), tag: `${kind}-${pid}`,
+        text: (t) => (kind === "refill" ? t.refill() : t.appointment()), tag: `${kind}-${pid}`,
       });
       console.log(`${kind} ${pid}: ${sent} notifications`);
     }

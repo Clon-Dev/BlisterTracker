@@ -1,12 +1,12 @@
 // Home screen additions: supplies & appointment, daily note, travel notice, and their sheets.
-import { useState } from "react";
-import { Pressable, Text, TextInput, View } from "react-native";
+import { useEffect, useRef, useState } from "react";
+import { Pressable, Text, TextInput, View, type TextInputInstance } from "react-native";
 import {
   CalendarClock, Check, ChevronRight, Download, Globe2, NotebookPen, Package, SkipForward, Stethoscope, Trash2, type LucideIcon,
 } from "lucide-react-native";
 import { addDays, clock, isTaken, packsLeft, zonedTime } from "../shared/schedule";
 import { DatePicker } from "./DatePicker";
-import { MOODS, setAppointment, setNote, setSupply, startPackEarly, todayOf, type Note, type Schedule } from "./data";
+import { appointmentNoteOf, MOODS, setAppointment, setNote, setSupply, startPackEarly, todayOf, type Note, type Schedule } from "./data";
 import { queued } from "./errors";
 import { formatDay, useI18n, type Lang, type Strings } from "./i18n";
 import { alert, openSheet, SheetIcon, toast } from "./sheets";
@@ -33,7 +33,7 @@ export function SuppliesCard({ pid, schedule }: { pid: string; schedule: Schedul
       <View style={st.divider} />
       <InfoRow icon={Stethoscope} tone="primary"
         title={appointment ? t.appointmentOn({ date: formatDay(appointment, lang) }) : t.appointmentNone}
-        subtitle={appointment ? schedule.appointmentNote || t.appointmentHint : t.appointmentAction}
+        subtitle={appointment ? (appointmentNoteOf(schedule) ?? t.lockedNote) || t.appointmentHint : t.appointmentAction}
         onPress={() => openSheet((done) => <AppointmentSheet pid={pid} schedule={schedule} done={done} />)} />
     </Card>
   );
@@ -76,7 +76,7 @@ function AppointmentSheet({ pid, schedule, done }: { pid: string; schedule: Sche
   const { t } = useI18n();
   const today = todayOf(schedule);
   const [day, setDay] = useState<string | null>(schedule.appointmentDay && schedule.appointmentDay >= today ? schedule.appointmentDay : null);
-  const [note, setNoteText] = useState(schedule.appointmentNote ?? "");
+  const [note, setNoteText] = useState(appointmentNoteOf(schedule) ?? "");
   return (
     <View>
       <SheetIcon icon={Stethoscope} />
@@ -119,8 +119,10 @@ function EarlyPackSheet({ pid, schedule, lang, done }: { pid: string; schedule: 
 // ---------- Daily notes ----------
 
 /** Mood chips, free text and the share switch. */
-function NoteEditor({ initial, onSave, onDelete }: { initial: OwnNote | null; onSave: (n: OwnNote) => void; onDelete?: () => void }) {
+function NoteEditor({ initial, onSave, onDelete, focusKey = 0 }: { initial: OwnNote | null; onSave: (n: OwnNote) => void; onDelete?: () => void; focusKey?: number }) {
   const { t } = useI18n();
+  const input = useRef<TextInputInstance>(null);
+  useEffect(() => { if (focusKey) input.current?.focus(); }, [focusKey]);
   const [mood, setMood] = useState<string | null>(initial?.mood ?? null);
   const [text, setText] = useState(initial?.text ?? "");
   const [shared, setShared] = useState(initial?.shared ?? false);
@@ -135,7 +137,7 @@ function NoteEditor({ initial, onSave, onDelete }: { initial: OwnNote | null; on
           </Pressable>
         ))}
       </View>
-      <TextInput value={text} onChangeText={setText} placeholder={t.notePlaceholder} placeholderTextColor={C.placeholder} multiline maxLength={280}
+      <TextInput ref={input} value={text} onChangeText={setText} placeholder={t.notePlaceholder} placeholderTextColor={C.placeholder} multiline maxLength={280}
         style={st.noteInput} />
       <Toggle label={t.shareNote} value={shared} onChange={setShared} />
       <Button title={t.saveNote} icon={Check} disabled={!changed || (!mood && !text.trim())} style={{ marginTop: 18 }}
@@ -145,46 +147,56 @@ function NoteEditor({ initial, onSave, onDelete }: { initial: OwnNote | null; on
   );
 }
 
-export function NoteCard({ pid, day, note }: { pid: string; day: string; note: OwnNote | null }) {
+/** Today's note. `focusKey`: increment to focus the text field and let the card glow (the kitten sent you here). */
+export function NoteCard({ uid, pid, day, note, focusKey = 0 }: { uid: string; pid: string; day: string; note: OwnNote | null; focusKey?: number }) {
   const { t } = useI18n();
+  const [glow, setGlow] = useState(false);
+  useEffect(() => {
+    if (!focusKey) return;
+    setGlow(true);
+    const id = setTimeout(() => setGlow(false), 1800);
+    return () => clearTimeout(id);
+  }, [focusKey]);
   return (
-    <Card>
+    <Card style={glow && { borderColor: C.primary, borderWidth: 2 }}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
         <NotebookPen size={19} color={C.primaryDeep} strokeWidth={2.3} />
         <Text style={[s.h2, { flex: 1 }]}>{t.noteTitle}</Text>
         {note && <Badge tone={note.shared ? "primary" : "neutral"} label={note.shared ? t.sharedBadge : t.privateBadge} />}
       </View>
-      <NoteEditor key={JSON.stringify(note)} initial={note}
-        onSave={(n) => { queued(setNote(pid, day, { text: n.text, mood: n.mood }, n.shared, note?.shared ?? null)); toast(t.noteSaved); }} />
+      <NoteEditor key={JSON.stringify(note)} initial={note} focusKey={focusKey}
+        onSave={(n) => { queued(setNote(uid, pid, day, { text: n.text, mood: n.mood }, n.shared, note?.shared ?? null)); toast(t.noteSaved); }} />
     </Card>
   );
 }
 
 /** Edit (or delete) the note of a past day. */
-export function openNoteSheet(pid: string, day: string, note: OwnNote | null, lang: Lang) {
-  return openSheet<void>((done) => <NoteSheet pid={pid} day={day} note={note} lang={lang} done={done} />);
+export function openNoteSheet(uid: string, pid: string, day: string, note: OwnNote | null, lang: Lang) {
+  return openSheet<void>((done) => <NoteSheet uid={uid} pid={pid} day={day} note={note} lang={lang} done={done} />);
 }
 
-function NoteSheet({ pid, day, note, lang, done }: { pid: string; day: string; note: OwnNote | null; lang: Lang; done: () => void }) {
+function NoteSheet({ uid, pid, day, note, lang, done }: { uid: string; pid: string; day: string; note: OwnNote | null; lang: Lang; done: () => void }) {
   const { t } = useI18n();
   return (
     <View>
       <SheetIcon icon={NotebookPen} />
       <Text style={s.h1}>{formatDay(day, lang)}</Text>
       <NoteEditor initial={note}
-        onSave={(n) => { queued(setNote(pid, day, { text: n.text, mood: n.mood }, n.shared, note?.shared ?? null)); done(); toast(t.noteSaved); }}
-        onDelete={() => { if (note) queued(setNote(pid, day, null, note.shared, note.shared)); done(); }} />
+        onSave={(n) => { queued(setNote(uid, pid, day, { text: n.text, mood: n.mood }, n.shared, note?.shared ?? null)); done(); toast(t.noteSaved); }}
+        onDelete={() => { if (note) queued(setNote(uid, pid, day, null, note.shared, note.shared)); done(); }} />
     </View>
   );
 }
 
 /** Read-only note line (history list, follower card). */
 export function NoteLine({ note, label, badge }: { note: Note; label?: string; badge?: string }) {
+  const { t } = useI18n();
   return (
     <View style={st.noteLine}>
-      <Text style={{ fontSize: 22 }}>{note.mood ?? "📝"}</Text>
+      <Text style={{ fontSize: 22 }}>{note.locked ? "🔒" : note.mood ?? "📝"}</Text>
       <View style={{ flex: 1 }}>
         {label ? <Text style={[s.small, F.bold]}>{label}</Text> : null}
+        {note.locked ? <Text style={[s.small, { marginTop: 2 }]}>{t.lockedNote}</Text> : null}
         {note.text ? <Text style={[s.body, { marginTop: label ? 2 : 0 }]}>{note.text}</Text> : null}
       </View>
       {badge ? <Badge tone="neutral" label={badge} /> : null}

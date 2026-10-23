@@ -14,6 +14,8 @@
   "dependencies": {
     "@expo-google-fonts/plus-jakarta-sans": "^0.4.2",
     "@expo/metro-runtime": "~58.0.14",
+    "@noble/ciphers": "^2.4.0",
+    "@noble/hashes": "^2.4.0",
     "@react-native-async-storage/async-storage": "2.2.0",
     "expo": "~58.0.16",
     "expo-application": "~58.1.2",
@@ -27,6 +29,7 @@
     "expo-linear-gradient": "~58.0.3",
     "expo-localization": "~58.0.5",
     "expo-notifications": "~58.1.5",
+    "expo-secure-store": "~58.0.2",
     "expo-status-bar": "~58.0.3",
     "firebase": "^13.0.0",
     "lucide-react-native": "^1.59.0",

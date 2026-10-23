@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ActivityIndicator, AppState, Platform, Pressable, ScrollView, Text, useColorScheme, useWindowDimensions, View } from "react-native";
+import { ActivityIndicator, Animated, AppState, Platform, Pressable, ScrollView, Text, useColorScheme, useWindowDimensions, View } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
 import { useFonts } from "expo-font";
@@ -9,49 +9,69 @@ import { LinearGradient } from "expo-linear-gradient";
 import { onAuthStateChanged, type User } from "firebase/auth";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
-  AlertTriangle, BellRing, CalendarDays, Check, Clock3, Copy, KeyRound, MailWarning, Moon, Pill, Plus, SkipForward, SlidersHorizontal,
+  AlertTriangle, BellRing, CalendarDays, Check, Clock3, Copy, Eye, EyeOff, KeyRound, LockKeyhole, MailWarning, Moon, Pencil, Pill, Plus, SkipForward, SlidersHorizontal, Tag,
   UserMinus, UserPlus, UserRound, type LucideIcon,
 } from "lucide-react-native";
-import { addDays, cycleLength, dayKey, isTaken, slot, zonedTime } from "./shared/schedule";
+import { addDays, cycleLength, dayKey, firstEditableDay, isTaken, slot, trackFromPackStart, zonedTime } from "./shared/schedule";
 import { auth } from "./src/firebase";
 import { AccountScreen } from "./src/AccountScreen";
-import { setAuthLanguage, resendVerification } from "./src/auth";
+import { setAuthLanguage, resendVerification, takePendingPassword } from "./src/auth";
+import { ErrorBoundary } from "./src/ErrorBoundary";
+import { openRecoveryCodeSheet, openUnlockSharedSheet, UnlockScreen } from "./src/EncryptionScreens";
+import { createKeyring, followedShareKey, loadCachedKey, ownShareKey, syncKeyring, unlockWithPassword, useDataKey } from "./src/keys";
 import { AuthScreen } from "./src/AuthScreen";
 import { Blister } from "./src/Blister";
 import {
-  deviceTz, ensureAccount, fetchHasPassword, hasSchedule, registerToken, setAccountLang, setTaken, setTimezone, todayOf,
-  unsubscribe, watchAccount, watchNotes, watchProfile, watchSubscriberCount, type Account, type Notes, type Profile, type Schedule,
+  deviceTz, ensureAccount, fetchSharing, hasSchedule, migrateToEncryption, openNotes, registerToken, renameSchedule, setAccountLang, setTaken,
+  setTimezone, todayOf, unsubscribe, watchAccount, watchNotes, watchProfile, watchSubscriberCount,
+  type Account, type Notes, type Profile, type Schedule, type Sharing, type StoredNotes,
 } from "./src/data";
 import { NoteCard, NoteLine, openEarlyPackSheet, SuppliesCard, TravelNotice, UpdateCard, type OwnNote } from "./src/HomeCards";
 import { checkForUpdate, type Release } from "./src/update";
+import type { PillState } from "./src/mascot/brain";
+import { loadMascot } from "./src/mascot/store";
+import { MascotProvider, MascotSpot, useMascotScroll } from "./src/mascot/world";
 import { PasswordForm, ScheduleWizard, SubscribeForm } from "./src/Forms";
 import { HistoryScreen } from "./src/HistoryScreen";
 import { formatDay, loadSavedLang, useI18n, type Lang, type Strings } from "./src/i18n";
 import { missedDays, packCells } from "./src/pack";
 import { enablePush, onTakenAction, pushStatus, registerTakenAction, type PushStatus } from "./src/push";
-import { alert, confirm, SheetHost, toast, ToastHost } from "./src/sheets";
+import { alert, confirm, openSheet, SheetHost, SheetIcon, toast, ToastHost } from "./src/sheets";
 import { openDaySheet } from "./src/TakenTime";
 import { C, F, fonts, G, loadAppearance, R, setSystemDark, shadow, themedStyles, useThemeVersion } from "./src/theme";
 import { errorText, queued } from "./src/errors";
-import { Badge, Button, Card, IconButton, LanguageSwitch, LinkButton, ProgressRing, s, SectionTitle } from "./src/ui";
+import { Badge, Button, Card, Field, IconButton, LanguageSwitch, LinkButton, ProgressRing, s, SectionTitle } from "./src/ui";
 
 type Screen = "home" | "password" | "subscribe" | "schedule" | "account" | "history";
 type Followed = Profile | "denied" | undefined;
 
+/**
+ * Fonts get a few seconds to load; after that (or if a download fails) the app starts anyway. Waiting for
+ * them forever left an empty screen whenever a font file didn't arrive, e.g. on a flaky network at launch.
+ */
+function useFontsReady() {
+  const [loaded, error] = useFonts(fonts);
+  const [waited, setWaited] = useState(false);
+  useEffect(() => { const id = setTimeout(() => setWaited(true), 3000); return () => clearTimeout(id); }, []);
+  return loaded || !!error || waited;
+}
+
 export default function App() {
-  const [fontsLoaded] = useFonts(fonts);
+  const fontsReady = useFontsReady();
   const systemDark = useColorScheme() === "dark";
   const [themeReady, setThemeReady] = useState(false);
-  useEffect(() => { loadAppearance(systemDark).then(() => setThemeReady(true)); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { Promise.all([loadAppearance(systemDark), loadMascot()]).then(() => setThemeReady(true)); }, []); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { if (themeReady) setSystemDark(systemDark); }, [systemDark, themeReady]);
   useThemeVersion(); // re-render with the new palette
   return (
     <SafeAreaProvider>
       <SafeAreaView style={{ flex: 1, backgroundColor: C.bg }} edges={["top", "left", "right"]}>
         <StatusBar style={C.dark ? "light" : "dark"} />
-        {fontsLoaded && themeReady ? <Root /> : <View style={{ flex: 1 }} />}
-        <SheetHost />
-        <ToastHost />
+        <ErrorBoundary>
+          {fontsReady && themeReady ? <Root /> : <View style={{ flex: 1 }} />}
+          <SheetHost />
+          <ToastHost />
+        </ErrorBoundary>
       </SafeAreaView>
     </SafeAreaProvider>
   );
@@ -74,6 +94,7 @@ function Root() {
 
   useEffect(() => setAuthLanguage(lang), [lang]);
   useEffect(() => {
+    if (Platform.OS === "web") (globalThis as { bbStarted?: () => void }).bbStarted?.(); // hide the HTML start screen
     let unsub = () => {};
     loadSavedLang().then(() => { unsub = onAuthStateChanged(auth, setUser); });
     return () => unsub();
@@ -109,18 +130,20 @@ function Main({ user }: { user: User }) {
   const [account, setAccount] = useState<Account | null>(null);
   const [own, setOwn] = useState<Profile | null>(null);
   const [followed, setFollowed] = useState<Record<string, Followed>>({});
-  const [passwordSet, setPasswordSet] = useState(false);
+  const [sharing, setSharing] = useState<Sharing>({ set: false, password: null });
   const [subscriberCount, setSubscriberCount] = useState(0);
   const [push, setPush] = useState<PushStatus | null>(null);
   const [pushToken, setPushToken] = useState<string | null>(null);
   const [emailVerified, setEmailVerified] = useState(user.emailVerified);
   const [screen, setScreen] = useState<Screen>("home");
   const [historyOf, setHistoryOf] = useState<string | null>(null);
-  const [sharedNotes, setSharedNotes] = useState<Notes>({});
-  const [privateNotes, setPrivateNotes] = useState<Notes>({});
-  const [followedNotes, setFollowedNotes] = useState<Record<string, Notes>>({});
+  const [sharedNotes, setSharedNotes] = useState<StoredNotes>({});
+  const [privateNotes, setPrivateNotes] = useState<StoredNotes>({});
+  const [storedFollowedNotes, setFollowedNotes] = useState<Record<string, StoredNotes>>({});
   const [keptZones, setKeptZones] = useState<string | null>(null);
   const [release, setRelease] = useState<Release | null>(null);
+  const mascotScroll = useMascotScroll();
+  const [noteFocus, setNoteFocus] = useState(0);
 
   // App updates (Android APK): check on start and when the app returns, at most every 6 hours.
   useEffect(() => {
@@ -154,6 +177,45 @@ function Main({ user }: { user: User }) {
     return () => unsub();
   }, [attempt]); // eslint-disable-line react-hooks/exhaustive-deps -- uid is fixed per Main; lang only seeds a new account
 
+  // End-to-end encryption: this device needs the unlocked data key. Order: key cached on the device →
+  // password from the login that just happened → unlock screen (once per device).
+  const dataKey = useDataKey();
+  const [keyState, setKeyState] = useState<"checking" | "ready" | "locked" | "recover">("checking");
+  const [loginPassword, setLoginPassword] = useState<string | undefined>(undefined);
+  useEffect(() => { syncKeyring(account?.keyring); }, [account?.keyring]);
+  const accountLoaded = !!account;
+  useEffect(() => {
+    if (!account || keyState !== "checking") return;
+    (async () => {
+      syncKeyring(account.keyring);
+      if (await loadCachedKey(uid)) return setKeyState("ready");
+      const password = takePendingPassword();
+      if (password) {
+        if (!account.keyring) {
+          openRecoveryCodeSheet(await createKeyring(uid, password));
+          return setKeyState("ready");
+        }
+        try {
+          await unlockWithPassword(uid, password);
+          return setKeyState("ready");
+        } catch {
+          setLoginPassword(password); // the recovery screen re-wraps the keyring with it
+          return setKeyState("recover"); // logged in with a password that doesn't open the keyring: it was reset
+        }
+      }
+      setKeyState("locked");
+    })().catch(() => setKeyState("locked"));
+  }, [accountLoaded]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // After unlocking: encrypt what was stored in plain text before (once; idempotent).
+  const ownLoaded = own !== null;
+  useEffect(() => {
+    if (keyState !== "ready" || !account || !ownLoaded) return;
+    migrateToEncryption(uid, account.pid, hasSchedule(own) ? own : null)
+      .then(() => fetchSharing(account.pid))
+      .then(setSharing, () => undefined);
+  }, [keyState, ownLoaded]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Notifications are sent in the account's language.
   useEffect(() => {
     if (account && account.lang !== lang) queued(setAccountLang(uid, lang));
@@ -166,9 +228,9 @@ function Main({ user }: { user: User }) {
       watchProfile(pid, setOwn), watchSubscriberCount(pid, setSubscriberCount),
       watchNotes(pid, "shared", setSharedNotes), watchNotes(pid, "private", setPrivateNotes),
     ];
-    fetchHasPassword(pid).then(setPasswordSet, () => undefined);
     return () => unsubs.forEach((u) => u());
   }, [pid]);
+  useEffect(() => { if (pid) fetchSharing(pid).then(setSharing, () => undefined); }, [pid, dataKey]);
 
   // One live listener per followed schedule.
   const subsKey = account?.subs.join(",") ?? "";
@@ -204,13 +266,17 @@ function Main({ user }: { user: User }) {
   useEffect(() => { refreshPush(false); }, [pid]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const schedule = hasSchedule(own) ? own : null;
-  /** Own notes from both docs, marked with where they live. */
+  /** Own notes from both docs (decrypted), marked with where they live. */
+  const keyring = account?.keyring;
   const ownNotes = useMemo(() => {
     const all: Record<string, OwnNote> = {};
-    for (const [d, n] of Object.entries(privateNotes)) all[d] = { ...n, shared: false };
-    for (const [d, n] of Object.entries(sharedNotes)) all[d] = { ...n, shared: true };
+    for (const [d, n] of Object.entries(openNotes(privateNotes, dataKey))) all[d] = { ...n, shared: false };
+    for (const [d, n] of Object.entries(openNotes(sharedNotes, ownShareKey(keyring)))) all[d] = { ...n, shared: true };
     return all;
-  }, [sharedNotes, privateNotes]);
+  }, [sharedNotes, privateNotes, dataKey, keyring]);
+  /** Followed schedules' shared notes, decrypted with the share keys this account holds. */
+  const followedNotes = useMemo(() => Object.fromEntries(Object.entries(storedFollowedNotes)
+    .map(([p, n]) => [p, openNotes(n, followedShareKey(p, keyring))])) as Record<string, Notes>, [storedFollowedNotes, dataKey, keyring]);
 
   // Travelling: the device is in another zone than the schedule. "Keep home time" is remembered per zone pair.
   const here = deviceTz();
@@ -220,8 +286,8 @@ function Main({ user }: { user: User }) {
 
   /** Opens the day sheet (now / earlier / change / unmark) and saves the choice. */
   const editDay = useCallback(async (sch: Schedule, day: string) => {
-    if (!pid || slot(sch, day).kind === "break" || day > todayOf(sch) || day < sch.trackingSince) return;
-    const action = await openDaySheet(sch, day, lang);
+    if (!pid || slot(sch, day).kind === "break" || day > todayOf(sch) || day < firstEditableDay(sch)) return;
+    const action = await openDaySheet(trackFromPackStart(sch), day, lang); // pre-setup pills show as taken (time unknown)
     if (!action) return;
     queued(setTaken(pid, sch, day, "untake" in action ? null : action.time));
     if (!("untake" in action)) { celebrate(); toast(t.markedToast); }
@@ -245,27 +311,45 @@ function Main({ user }: { user: User }) {
       <Button title={t.tryAgain} onPress={() => { setError(null); setAttempt((n) => n + 1); }} />
     </View>
   );
-  if (!account) return <Loading text={t.loading} />;
+  if (!account || keyState === "checking") return <Loading text={t.loading} />;
+  if (keyState !== "ready") return (
+    <ScrollView key={`unlock-${themeVersion}`} contentContainerStyle={scrollContent} keyboardShouldPersistTaps="handled">
+      <UnlockScreen user={user} hasKeyring={!!account.keyring} initialMode={keyState === "recover" ? "recover" : undefined}
+        knownPassword={loginPassword} onReady={(code) => { setLoginPassword(undefined); if (code) openRecoveryCodeSheet(code); setKeyState("ready"); }} />
+    </ScrollView>
+  );
 
   const home = () => setScreen("home");
   const showHistory = (p: string) => { setHistoryOf(p); setScreen("history"); };
   const historyProfile = historyOf === account.pid ? own : historyOf ? followed[historyOf] : null;
   const historySchedule = historyProfile && historyProfile !== "denied" && hasSchedule(historyProfile) ? historyProfile : null;
 
+  // The kitten on the home screen: today's pill (read when it checks, since "overdue" starts with time) and today's note.
+  const todayPill = (): PillState => {
+    if (!schedule) return null;
+    const info = todayInfo(schedule);
+    return { number: info.index + 1, state: info.state, minutesLate: Math.floor((Date.now() - zonedTime(info.day, schedule.time, schedule.tz)) / 60_000) };
+  };
+  const pillDay = schedule && slot(schedule, todayOf(schedule)).kind !== "break";
+
   return (
     // key: each screen starts scrolled to the top; a theme switch redraws everything with the new palette.
-    <ScrollView key={`${screen}-${themeVersion}`} contentContainerStyle={scrollContent} keyboardShouldPersistTaps="handled">
+    <Animated.ScrollView key={`${screen}-${themeVersion}`} ref={mascotScroll.ref} contentContainerStyle={scrollContent} keyboardShouldPersistTaps="handled"
+      onScroll={mascotScroll.onScroll} scrollEventThrottle={16} onLayout={mascotScroll.onLayout}>
       {screen === "account" && <AccountScreen user={user} account={account} pushToken={pushToken} onBack={home} onUpdateFound={setRelease} />}
-      {screen === "password" && <PasswordForm pid={account.pid} hasPassword={passwordSet} onSaved={() => { setPasswordSet(true); home(); }} onBack={home} />}
+      {screen === "password" && <PasswordForm uid={uid} pid={account.pid} hasPassword={sharing.set} onSaved={(password) => { setSharing({ set: true, password }); home(); }} onBack={home} />}
       {screen === "subscribe" && <SubscribeForm uid={uid} ownPid={account.pid} onBack={home} />}
       {screen === "schedule" && <ScheduleWizard uid={uid} pid={account.pid} current={own} width={width} onBack={home} />}
       {screen === "history" && historySchedule && (
         <HistoryScreen schedule={historySchedule} onBack={home}
           notes={historyOf === account.pid ? ownNotes : followedNotes[historyOf!] ?? {}}
-          ownerPid={historyOf === account.pid ? account.pid : undefined}
+          owner={historyOf === account.pid ? { uid, pid: account.pid } : undefined}
           onEditDay={historyOf === account.pid ? (day) => editDay(historySchedule, day) : undefined} />
       )}
-      {screen === "home" && <>
+      {screen === "home" && <MascotProvider scroll={mascotScroll} day={today} getPill={todayPill}
+        takenToday={schedule && pillDay ? isTaken(schedule, todayOf(schedule)) : null}
+        hasNoteToday={schedule ? !!ownNotes[todayOf(schedule)] : null}
+        onTakePill={() => schedule && editDay(schedule, todayOf(schedule))} onFocusNote={() => setNoteFocus((n) => n + 1)}>
         <View style={st.topBar}>
           <LinearGradient colors={G.primary} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={st.logo}>
             <Pill size={20} color={C.white} strokeWidth={2.4} />
@@ -280,6 +364,9 @@ function Main({ user }: { user: User }) {
         {!emailVerified && (
           <Notice icon={MailWarning} tone="warning" text={t.verifyBanner({ email: user.email ?? "" })}
             action={t.verifyResend} onAction={() => resendVerification(user).then(() => toast(t.verifySent), (e) => alert(t.errorTitle, errorText(e)))} />
+        )}
+        {sharing.set && sharing.password === null && (
+          <Notice icon={KeyRound} tone="warning" text={t.sharingAgainNotice} action={t.setItAgain} onAction={() => setScreen("password")} />
         )}
         {push && push !== "granted" && (
           <Notice icon={BellRing} tone="primary"
@@ -297,29 +384,32 @@ function Main({ user }: { user: User }) {
           ? <OwnSchedule schedule={schedule} today={today} width={width} t={t} lang={lang}
               onEditDay={(day) => editDay(schedule, day)} onHistory={() => showHistory(account.pid)} onEdit={() => setScreen("schedule")}
               onEarlyPack={() => openEarlyPackSheet(account.pid, schedule, lang)}
-              extra={<>
-                <NoteCard pid={account.pid} day={todayOf(schedule)} note={ownNotes[todayOf(schedule)] ?? null} />
-              </>}
-              after={<SuppliesCard pid={account.pid} schedule={schedule} />} />
-          : <SetupCard t={t} onCreate={() => setScreen("schedule")} />}
+              onRename={() => openRenameSheet(account.pid, schedule.name, t)}
+              extra={<MascotSpot id="note">
+                <NoteCard uid={uid} pid={account.pid} day={todayOf(schedule)} note={ownNotes[todayOf(schedule)] ?? null} focusKey={noteFocus} />
+              </MascotSpot>}
+              after={<MascotSpot id="supplies"><SuppliesCard pid={account.pid} schedule={schedule} /></MascotSpot>} />
+          : <MascotSpot id="setup"><SetupCard t={t} onCreate={() => setScreen("schedule")} /></MascotSpot>}
 
-        <IdCard pid={account.pid} passwordSet={passwordSet} followers={subscriberCount} t={t} onPassword={() => setScreen("password")} />
+        <MascotSpot id="id"><IdCard pid={account.pid} sharing={sharing} followers={subscriberCount} t={t} onPassword={() => setScreen("password")} /></MascotSpot>
 
         <Button title={t.followSchedule} icon={UserPlus} onPress={() => setScreen("subscribe")} style={{ marginTop: 18 }} />
 
         {account.subs.length > 0 && <SectionTitle title={t.following} />}
         {account.subs.map((p) => (
-          <FollowedSchedule key={p} pid={p} profile={followed[p]} notes={followedNotes[p] ?? {}} today={today} width={width} t={t} onHistory={() => showHistory(p)}
+          <MascotSpot key={p} id={`follow-${p}`}><FollowedSchedule pid={p} profile={followed[p]} notes={followedNotes[p] ?? {}} today={today} width={width} t={t} onHistory={() => showHistory(p)}
+            canRead={!!followedShareKey(p, keyring)} onUnlock={(name) => openUnlockSharedSheet(uid, p, name)}
             onRemove={async () => {
               const f = followed[p];
               const name = (f && f !== "denied" && f.name) || p;
               if (await confirm({ title: t.unsubscribeTitle, message: t.unsubscribeBody({ name }), confirmLabel: t.unsubscribe, destructive: true, icon: UserMinus })) {
                 queued(unsubscribe(uid, p));
               }
-            }} />
+            }} /></MascotSpot>
         ))}
-      </>}
-    </ScrollView>
+        <MascotSpot id="end" inset={0}><View style={{ height: 1 }} /></MascotSpot>
+      </MascotProvider>}
+    </Animated.ScrollView>
   );
 }
 
@@ -406,9 +496,9 @@ function Legend({ t, sch }: { t: Strings; sch: Schedule }) {
   );
 }
 
-function OwnSchedule({ schedule, today, width, t, lang, onEditDay, onHistory, onEdit, onEarlyPack, extra, after }: {
+function OwnSchedule({ schedule, today, width, t, lang, onEditDay, onHistory, onEdit, onEarlyPack, onRename, extra, after }: {
   schedule: Schedule; today: string; width: number; t: Strings; lang: Lang;
-  onEditDay: (day: string) => void; onHistory: () => void; onEdit: () => void; onEarlyPack: () => void;
+  onEditDay: (day: string) => void; onHistory: () => void; onEdit: () => void; onEarlyPack: () => void; onRename: () => void;
   /** Rendered between the hero and the pack card / after the pack card. */
   extra: React.ReactNode; after: React.ReactNode;
 }) {
@@ -428,6 +518,7 @@ function OwnSchedule({ schedule, today, width, t, lang, onEditDay, onHistory, on
 
   return (
     <>
+      <MascotSpot id="hero">
       <LinearGradient colors={G.hero} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={[st.hero, shadow(3)]}>
         <View style={st.heroBubble} />
         <View style={[st.heroBubble, { width: 130, height: 130, right: undefined, top: undefined, left: -45, bottom: -60, opacity: 0.08 }]} />
@@ -446,6 +537,7 @@ function OwnSchedule({ schedule, today, width, t, lang, onEditDay, onHistory, on
           ? <Button title={t.changeTime} kind="light" icon={Clock3} compact onPress={() => onEditDay(info.day)} style={{ marginTop: 18 }} />
           : <Button title={t.takeCta} kind="light" icon={Check} onPress={() => onEditDay(info.day)} style={{ marginTop: 18 }} />)}
       </LinearGradient>
+      </MascotSpot>
 
       {missed.length > 0 && (
         <Notice icon={AlertTriangle} tone="danger"
@@ -455,12 +547,16 @@ function OwnSchedule({ schedule, today, width, t, lang, onEditDay, onHistory, on
 
       {extra}
 
+      <MascotSpot id="pack">
       <Card>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-          <View style={{ flex: 1 }}>
-            <Text style={s.h2} numberOfLines={1}>{schedule.name || t.myPack}</Text>
+          <Pressable style={{ flex: 1 }} onPress={onRename} accessibilityRole="button" accessibilityLabel={t.renameTitle}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+              <Text style={[s.h2, { flexShrink: 1 }]} numberOfLines={1}>{schedule.name || t.myPack}</Text>
+              <Pencil size={14} color={C.muted} strokeWidth={2.4} />
+            </View>
             <Text style={[s.small, { marginTop: 2 }]}>{isBreak ? t.breakOf({ n, total }) : t.pillOfShort({ n, total })}</Text>
-          </View>
+          </Pressable>
           <IconButton icon={CalendarDays} label={t.history} onPress={onHistory} />
           <IconButton icon={SkipForward} label={t.earlyTitle} onPress={onEarlyPack} />
           <IconButton icon={SlidersHorizontal} label={t.editSchedule} onPress={onEdit} />
@@ -468,12 +564,32 @@ function OwnSchedule({ schedule, today, width, t, lang, onEditDay, onHistory, on
         <PackView sch={schedule} today={today} width={Math.min(width - 82, 440)} onPressDay={onEditDay} />
         <Legend t={t} sch={schedule} />
       </Card>
+      </MascotSpot>
       {after}
     </>
   );
 }
 
-function IdCard({ pid, passwordSet, followers, t, onPassword }: { pid: string; passwordSet: boolean; followers: number; t: Strings; onPassword: () => void }) {
+function openRenameSheet(pid: string, current: string, t: Strings) {
+  openSheet<void>((done) => <RenameSheet pid={pid} current={current} t={t} done={done} />);
+}
+
+function RenameSheet({ pid, current, t, done }: { pid: string; current: string; t: Strings; done: () => void }) {
+  const [name, setName] = useState(current);
+  const save = () => { queued(renameSchedule(pid, name)); done(); toast(t.renamed); };
+  return (
+    <View>
+      <SheetIcon icon={Tag} />
+      <Text style={s.h1}>{t.renameTitle}</Text>
+      <Field label={t.nameLabel} icon={Tag} value={name} onChangeText={setName} maxLength={30} autoFocus onSubmitEditing={save} />
+      <Button title={t.save} icon={Check} disabled={name.trim() === current} onPress={save} style={{ marginTop: 20 }} />
+    </View>
+  );
+}
+
+function IdCard({ pid, sharing, followers, t, onPassword }: { pid: string; sharing: Sharing; followers: number; t: Strings; onPassword: () => void }) {
+  const passwordSet = sharing.set;
+  const [revealed, setRevealed] = useState(false);
   return (
     <Card>
       <Text style={s.eyebrow}>{t.yourId}</Text>
@@ -488,16 +604,35 @@ function IdCard({ pid, passwordSet, followers, t, onPassword }: { pid: string; p
         </View>
         <Text style={[s.small, F.semibold, { flex: 1, color: C.text }]}>{passwordSet ? t.subscriberLine({ n: followers }) : t.noPasswordHint}</Text>
       </View>
+      {passwordSet && (sharing.password !== null ? (
+        <View style={st.secret}>
+          <View style={{ flex: 1 }}>
+            <Text style={s.eyebrow}>{t.sharingPassword}</Text>
+            <Text selectable style={[st.secretText, !revealed && { letterSpacing: 3 }]} testID="sharing-password">
+              {revealed ? sharing.password : "•".repeat(Math.max(6, sharing.password.length))}
+            </Text>
+          </View>
+          {revealed && <IconButton icon={Copy} label={t.copyPassword} size={38}
+            onPress={() => Clipboard.setStringAsync(sharing.password!).then(() => toast(t.passwordCopied))} />}
+          <IconButton icon={revealed ? EyeOff : Eye} label={revealed ? t.hidePassword : t.showPassword} size={38} onPress={() => setRevealed(!revealed)} />
+        </View>
+      ) : null)}
       <Button title={passwordSet ? t.changePassword : t.setPassword} kind="secondary" compact onPress={onPassword} />
     </Card>
   );
 }
 
-function FollowedSchedule({ pid, profile, notes, today, width, t, onHistory, onRemove }: {
+function FollowedSchedule({ pid, profile, notes, today, width, t, onHistory, onRemove, canRead, onUnlock }: {
   pid: string; profile: Followed; notes: Notes; today: string; width: number; t: Strings; onHistory: () => void; onRemove: () => void;
+  /** This account holds the schedule's share key; otherwise shared notes need the sharing password once. */
+  canRead: boolean; onUnlock: (name: string) => void;
 }) {
   const sch = profile && profile !== "denied" && hasSchedule(profile) ? profile : null;
   const todaysNote = sch ? notes[todayOf(sch)] : undefined;
+  const someLocked = Object.values(notes).some((n) => n.locked);
+  // The key can be fetched once the owner has published it; until then there is nothing to enter.
+  const canUnlock = !!sch?.shareKeyWrap && (!canRead || someLocked);
+  const waiting = !!sch && !sch.shareKeyWrap && someLocked;
   const name = sch?.name || pid;
   return (
     <Card>
@@ -515,6 +650,8 @@ function FollowedSchedule({ pid, profile, notes, today, width, t, onHistory, onR
       {profile === "denied" && <Text style={[s.muted, { marginTop: 12 }]}>{t.noLongerAvailable}</Text>}
       {profile && profile !== "denied" && !sch && <Text style={[s.muted, { marginTop: 12 }]}>{t.noScheduleYet}</Text>}
       {todaysNote && <View style={{ marginTop: 12 }}><NoteLine note={todaysNote} label={t.todaysNote} /></View>}
+      {canUnlock && <Button title={t.unlockSharedNotes} kind="secondary" compact icon={LockKeyhole} onPress={() => onUnlock(sch!.name || pid)} />}
+      {waiting && <Text style={[s.small, { marginTop: 10, color: C.muted }]}>🔒 {t.notesWaiting}</Text>}
       {sch && <PackView sch={sch} today={today} width={Math.min(width - 82, 400)} />}
       <View style={[st.divider, { marginBottom: 0 }]} />
       <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
@@ -534,5 +671,7 @@ const st = themedStyles(() => ({
   iconDot: { width: 36, height: 36, borderRadius: 18, alignItems: "center", justifyContent: "center" },
   pid: { ...F.extrabold, fontSize: 34, color: C.text, letterSpacing: 5 },
   divider: { height: 1, backgroundColor: C.border, marginVertical: 14 },
+  secret: { flexDirection: "row", alignItems: "center", gap: 8, backgroundColor: C.segment, borderRadius: R.md, paddingVertical: 10, paddingLeft: 14, paddingRight: 8, marginTop: 12 },
+  secretText: { ...F.bold, fontSize: 17, color: C.text, marginTop: 2 },
   avatar: { width: 46, height: 46, borderRadius: 23, alignItems: "center", justifyContent: "center" },
 }));

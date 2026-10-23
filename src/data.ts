@@ -3,11 +3,16 @@ import {
   arrayRemove, arrayUnion, collection, deleteField, doc, getDoc, getDocs, onSnapshot, setDoc, Timestamp, updateDoc, writeBatch,
   type Unsubscribe,
 } from "firebase/firestore";
-import { addDays, dayKey, nextLateAt, nextNoticeAt, nextReminderAt, slot, type Plan } from "../shared/schedule";
+import { addDays, dayKey, nextLateAt, nextNoticeAt, nextReminderAt, slot, trackFromPackStart, type Plan } from "../shared/schedule";
+import { accessKeyFor, decrypt, encrypt, isEncrypted, type Key } from "./crypto";
 import { db } from "./firebase";
+import {
+  addFollowedShareKey, currentDataKey, ensureOwnShareKey, removeFollowedShareKey, unwrapShareKeyWithPassword, wrapShareKeyForPassword,
+  type Keyring,
+} from "./keys";
 import { strings, type Lang } from "./i18n";
 
-export type Account = { pid: string; subs: string[]; tokens: string[]; lang?: Lang };
+export type Account = { pid: string; subs: string[]; tokens: string[]; lang?: Lang; keyring?: Keyring };
 /** users/{pid} with a schedule. The worker reads the same fields (see shared/schedule.ts). */
 export type Schedule = Plan & {
   ownerUid: string;
@@ -21,13 +26,18 @@ export type Schedule = Plan & {
   appointmentNote?: string;
   /** Replaces the wording of the owner's reminder ("" = default); at most 64 characters. */
   reminderText?: string;
+  /** The schedule's share key, wrapped with the sharing password (followers unwrap it once). */
+  shareKeyWrap?: string;
 };
 export const REMINDER_TEXT_MAX = 64;
 export const textLength = (text: string) => [...text].length; // code points, so an emoji counts once
 
 export const MOODS = ["😄", "🙂", "😐", "😕", "😣"] as const;
-export type Note = { text: string; mood: string | null };
+export type Note = { text: string; mood: string | null; /** Encrypted with a key this device doesn't have. */ locked?: boolean };
 export type Notes = Record<string, Note>;
+/** As stored: encrypted ({enc}) or, from before encryption, plain. */
+type StoredNote = { enc: string } | Note;
+export type StoredNotes = Record<string, StoredNote>;
 export type Profile = { ownerUid: string } & Partial<Schedule>;
 export type ScheduleInput = Pick<Schedule, "name" | "pillsPerPack" | "placebo" | "breakDays" | "time" | "repeatMinutes" | "lateMinutes"> & {
   reminderText: string;
@@ -42,7 +52,8 @@ const ID_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 const newPersonalId = () => Array.from(Crypto.getRandomBytes(6), (b) => ID_ALPHABET[b % ID_ALPHABET.length]).join("");
 export const normalizeId = (id: string) => id.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
 
-const accessKey = (pid: string, password: string) =>
+/** Access key from before encryption (fast SHA-256); only tried when an owner hasn't upgraded yet. */
+const legacyAccessKey = (pid: string, password: string) =>
   Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, `${pid}:${password}`);
 
 export const hasSchedule = (p: Profile | null | undefined): p is Schedule => typeof p?.packStart === "string";
@@ -119,11 +130,40 @@ export const watchProfile = (pid: string, cb: (p: Profile | null) => void, onErr
 export const watchSubscriberCount = (pid: string, cb: (n: number) => void) => resilient((onError) =>
   onSnapshot(collection(db, "users", pid, "subscribers"), (s) => cb(s.size), onError));
 
-export const fetchHasPassword = async (pid: string) => (await getDoc(authRef(pid))).exists();
-
-export async function setPassword(pid: string, password: string) {
-  await setDoc(authRef(pid), { key: await accessKey(pid, password) });
+/** Opens a value encrypted with `key`; plain values from before encryption pass through, unreadable ones give null. */
+function open<T>(value: unknown, key: Key | null): T | null {
+  if (!isEncrypted(value)) return (value as T) ?? null;
+  if (!key) return null;
+  try { return decrypt<T>(key, value); } catch { return null; }
 }
+
+/** Whether a sharing password is set, and the password itself if stored (encrypted with the data key). */
+export type Sharing = { set: boolean; password: string | null };
+export async function fetchSharing(pid: string): Promise<Sharing> {
+  const snap = await getDoc(authRef(pid));
+  return { set: snap.exists(), password: open<string>(snap.data()?.password, currentDataKey()) };
+}
+
+/**
+ * Prepares the sharing password: the slow access key followers must present, the password encrypted for the
+ * owner, and the schedule's share key wrapped with it (users/{pid}.shareKeyWrap) so new followers can read the
+ * shared notes. Existing followers already hold the share key, so they keep reading.
+ * The key derivation takes a moment (seconds on a phone), so this resolves once it is done, with the write to
+ * run next: not awaited by the caller, so it also works offline.
+ */
+export async function prepareSharingPassword(uid: string, pid: string, password: string) {
+  const shareKey = await ensureOwnShareKey(uid);
+  const access = { key: await accessKeyFor(pid, password), password: encrypt(currentDataKey()!, password) };
+  const shareKeyWrap = await wrapShareKeyForPassword(shareKey, password);
+  return () => {
+    const batch = writeBatch(db);
+    batch.set(authRef(pid), access);
+    batch.update(userRef(pid), { shareKeyWrap });
+    return batch.commit();
+  };
+}
+
+export const renameSchedule = (pid: string, name: string) => updateDoc(userRef(pid), { name: name.trim() });
 
 /** Language for this account's push notifications (read by the worker). */
 export const setAccountLang = (uid: string, lang: Lang) => updateDoc(accountRef(uid), { lang });
@@ -160,6 +200,8 @@ export async function saveSchedule(uid: string, pid: string, input: ScheduleInpu
     name: input.name.trim(),
     appointmentNote: prev?.appointmentNote ?? "",
     reminderText: input.reminderText.trim(),
+    // The doc is rewritten in full: keep the share-key wrap (it may exist before the first schedule).
+    ...(previous?.shareKeyWrap ? { shareKeyWrap: previous.shareKeyWrap } : {}),
     // Keep a pending "taken" notification; a fresh "taken today" from the wizard also notifies followers.
     takenPending: (prev?.takenPending ?? false) || (input.takenTodayAt !== null && !(today in (prev?.takenDays ?? {}))),
   };
@@ -169,17 +211,23 @@ export async function saveSchedule(uid: string, pid: string, input: ScheduleInpu
 /**
  * Marks the pill of `day` as taken at `time` ("HH:MM", or "" when unknown), or unmarks it (null).
  * Marking today's pill notifies followers. The UI never offers future days or times.
+ * A day from before the setup (the pills the setup declared taken) first turns those pills into real
+ * marks, so it can be changed like any other day.
  */
 export function setTaken(pid: string, s: Schedule, day: string, time: string | null) {
   const isToday = day === todayOf(s);
   const taken = time !== null;
-  const takenDays = { ...s.takenDays };
+  const tracked = day < s.trackingSince ? trackFromPackStart(s) : s; // only a pre-setup day needs the conversion
+  const takenDays = { ...tracked.takenDays };
   if (taken) takenDays[day] = time;
   else delete takenDays[day];
+  const newMarks = Object.keys(tracked.takenDays).filter((d) => !(d in s.takenDays) && d !== day);
   return updateDoc(userRef(pid), {
+    ...(tracked !== s ? { trackingSince: tracked.trackingSince } : {}),
+    ...Object.fromEntries(newMarks.map((d) => [`takenDays.${d}`, ""])),
     [`takenDays.${day}`]: taken ? time : deleteField(),
     takenPending: taken && isToday ? true : s.takenPending && !(isToday && !taken),
-    ...notificationTimes({ ...s, takenDays }),
+    ...notificationTimes({ ...tracked, takenDays }),
   });
 }
 
@@ -188,21 +236,36 @@ export function setTaken(pid: string, s: Schedule, day: string, time: string | n
  * Throws if the ID/password combination is wrong (the security rules reject the whole batch).
  */
 export async function subscribe(uid: string, pid: string, password: string) {
-  const batch = writeBatch(db);
-  batch.set(subscriberRef(pid, uid), { key: await accessKey(pid, password) });
-  batch.update(accountRef(uid), { subs: arrayUnion(pid) });
-  try {
+  const follow = async (key: string) => {
+    const batch = writeBatch(db);
+    batch.set(subscriberRef(pid, uid), { key });
+    batch.update(accountRef(uid), { subs: arrayUnion(pid) });
     await batch.commit();
+  };
+  try {
+    await follow(await accessKeyFor(pid, password));
   } catch {
-    throw new Error(strings().invalidCredentials);
+    // The owner may not have opened the new version yet (their key is still the old format).
+    try { await follow(await legacyAccessKey(pid, password)); } catch { throw new Error(strings().invalidCredentials); }
   }
+  await unlockFollowedNotes(uid, pid, password).catch(() => undefined); // not possible until the owner has upgraded
 }
 
-export function unsubscribe(uid: string, pid: string) {
+/** Picks up a followed schedule's share key with its sharing password (throws if wrong or not available yet). */
+export async function unlockFollowedNotes(uid: string, pid: string, password: string) {
+  const wrap = (await getDoc(userRef(pid))).data()?.shareKeyWrap as string | undefined;
+  if (!wrap) throw new Error(strings().notesNotReady);
+  let key: Key;
+  try { key = await unwrapShareKeyWithPassword(wrap, password); } catch { throw new Error(strings().invalidSharingPassword); }
+  await addFollowedShareKey(uid, pid, key);
+}
+
+export async function unsubscribe(uid: string, pid: string) {
   const batch = writeBatch(db);
   batch.delete(subscriberRef(pid, uid));
   batch.update(accountRef(uid), { subs: arrayRemove(pid) });
-  return batch.commit();
+  await batch.commit();
+  await removeFollowedShareKey(uid, pid);
 }
 
 export async function registerToken(uid: string, account: Account, token: string) {
@@ -240,8 +303,12 @@ export const setSupply = (pid: string, s: Schedule, unopened: number | null) =>
     ? { supplyPacks: 0 }
     : { supplyPacks: unopened + 1, supplyFrom: slot(s, todayOf(s)).packStart });
 
+/** The note is encrypted (only the owner can read it; the reminder push stays generic). */
 export const setAppointment = (pid: string, s: Schedule, day: string | null, note: string) =>
-  updatePlan(pid, s, { appointmentDay: day, appointmentNote: note.trim() });
+  updatePlan(pid, s, { appointmentDay: day, appointmentNote: note.trim() ? encrypt(currentDataKey()!, note.trim()) : "" });
+
+/** The appointment note, decrypted (null if this device can't open it). */
+export const appointmentNoteOf = (s: Schedule) => (s.appointmentNote ? open<string>(s.appointmentNote, currentDataKey()) : "");
 
 /** Reminders follow `tz` from now on (e.g. after moving or for a longer trip); the clock time stays. */
 export const setTimezone = (pid: string, s: Schedule, tz: string) => updatePlan(pid, s, { tz });
@@ -250,8 +317,18 @@ export const setTimezone = (pid: string, s: Schedule, tz: string) => updatePlan(
 
 const notesRef = (pid: string, which: "shared" | "private") => doc(db, "users", pid, "notes", which);
 
-export const watchNotes = (pid: string, which: "shared" | "private", cb: (n: Notes) => void, onError?: () => void) => resilient((retry) =>
-  onSnapshot(notesRef(pid, which), (snap) => cb((snap.data()?.days ?? {}) as Notes), retry), onError);
+export const watchNotes = (pid: string, which: "shared" | "private", cb: (n: StoredNotes) => void, onError?: () => void) => resilient((retry) =>
+  onSnapshot(notesRef(pid, which), (snap) => cb((snap.data()?.days ?? {}) as StoredNotes), retry), onError);
+
+/** Decrypts stored notes; entries this key can't open come back as `locked`. */
+export function openNotes(stored: StoredNotes, key: Key | null): Notes {
+  const out: Notes = {};
+  for (const [day, value] of Object.entries(stored)) {
+    const note = "enc" in value ? open<Note>(value.enc, key) : value;
+    out[day] = note ?? { text: "", mood: null, locked: true };
+  }
+  return out;
+}
 
 /**
  * Saves the note of `day` in the shared or private doc, or deletes it (note null). `wasShared` says where the
@@ -259,10 +336,54 @@ export const watchNotes = (pid: string, which: "shared" | "private", cb: (n: Not
  * in the same batch. (Only touch a doc that has the note: a merge write that only deletes would create a doc
  * without `days`, which the rules reject.)
  */
-export function setNote(pid: string, day: string, note: Note | null, shared: boolean, wasShared: boolean | null) {
+export async function setNote(uid: string, pid: string, day: string, note: Note | null, shared: boolean, wasShared: boolean | null) {
   const batch = writeBatch(db);
   const where = (isShared: boolean) => notesRef(pid, isShared ? "shared" : "private");
-  if (note) batch.set(where(shared), { days: { [day]: note } }, { merge: true });
+  if (note) {
+    // Shared notes: the schedule's share key (followers have it); private: the owner's data key.
+    const key = shared ? await ensureOwnShareKey(uid) : currentDataKey()!;
+    batch.set(where(shared), { days: { [day]: { enc: encrypt(key, { text: note.text, mood: note.mood }) } } }, { merge: true });
+  }
   if (wasShared !== null && (note === null || wasShared !== shared)) batch.update(where(wasShared), { [`days.${day}`]: deleteField() });
-  return batch.commit();
+  await batch.commit();
+}
+
+// ---------- One-time upgrade to encryption ----------
+
+/**
+ * Encrypts what was stored in plain text before encryption existed: notes, the appointment note and the
+ * stored sharing password (which also gets the slow access key and the share-key wrap for followers).
+ * Idempotent; runs after every unlock and does nothing once everything is encrypted.
+ * A sharing password that was only stored as a hash can't be upgraded (the owner has to set it again).
+ */
+export async function migrateToEncryption(uid: string, pid: string, schedule: Schedule | null) {
+  const dataKey = currentDataKey()!;
+  const batch = writeBatch(db);
+  let writes = 0;
+
+  const password = (await getDoc(authRef(pid))).data()?.password as string | undefined;
+  if (password !== undefined && !isEncrypted(password)) {
+    const shareKey = await ensureOwnShareKey(uid);
+    batch.set(authRef(pid), { key: await accessKeyFor(pid, password), password: encrypt(dataKey, password) });
+    batch.update(userRef(pid), { shareKeyWrap: await wrapShareKeyForPassword(shareKey, password) });
+    writes += 2;
+  }
+
+  for (const which of ["private", "shared"] as const) {
+    const days = ((await getDoc(notesRef(pid, which))).data()?.days ?? {}) as StoredNotes;
+    const plain = Object.entries(days).filter(([, v]) => !("enc" in v));
+    if (!plain.length) continue;
+    const key = which === "shared" ? await ensureOwnShareKey(uid) : dataKey;
+    const updated = { ...days };
+    for (const [day, note] of plain) updated[day] = { enc: encrypt(key, { text: (note as Note).text, mood: (note as Note).mood }) };
+    batch.set(notesRef(pid, which), { days: updated });
+    writes++;
+  }
+
+  if (schedule?.appointmentNote && !isEncrypted(schedule.appointmentNote)) {
+    batch.update(userRef(pid), { appointmentNote: encrypt(dataKey, schedule.appointmentNote) });
+    writes++;
+  }
+
+  if (writes) await batch.commit();
 }

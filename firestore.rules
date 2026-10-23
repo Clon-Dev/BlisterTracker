@@ -21,7 +21,7 @@ service cloud.firestore {
                                'time', 'tz', 'repeatMinutes', 'lateMinutes', 'takenDays',
                                'nextReminderAt', 'nextLateAt', 'takenPending',
                                'earlierPackStarts', 'supplyPacks', 'supplyFrom', 'appointmentDay', 'appointmentNote',
-                               'reminderText', 'nextNoticeAt'])
+                               'reminderText', 'nextNoticeAt', 'shareKeyWrap'])
         && d.name is string && d.name.size() <= 30
         && d.pillsPerPack is int && d.pillsPerPack >= 1 && d.pillsPerPack <= 91
         && d.placebo is int && d.placebo >= 0 && d.placebo < d.pillsPerPack
@@ -40,7 +40,9 @@ service cloud.firestore {
         && (!('supplyPacks' in d) || (d.supplyPacks is int && d.supplyPacks >= 0 && d.supplyPacks <= 24))
         && (!('supplyFrom' in d) || isDay(d.supplyFrom))
         && (!('appointmentDay' in d) || d.appointmentDay == null || isDay(d.appointmentDay))
-        && (!('appointmentNote' in d) || (d.appointmentNote is string && d.appointmentNote.size() <= 80))
+        // Encrypted (v1:…) since the encryption update, hence longer than the 80 characters typed.
+        && (!('appointmentNote' in d) || (d.appointmentNote is string && d.appointmentNote.size() <= 400))
+        && (!('shareKeyWrap' in d) || (d.shareKeyWrap is string && d.shareKeyWrap.size() <= 512))
         // 64 characters in the app; emoji can take several UTF-16 units each.
         && (!('reminderText' in d) || (d.reminderText is string && d.reminderText.size() <= 256))
         && (!('nextNoticeAt' in d) || d.nextNoticeAt == null || d.nextNoticeAt is timestamp);
@@ -49,7 +51,9 @@ service cloud.firestore {
     match /accounts/{uid} {
       allow read, delete: if signedIn() && request.auth.uid == uid;
       allow create, update: if signedIn() && request.auth.uid == uid
-        && request.resource.data.keys().hasOnly(['pid', 'subs', 'tokens', 'lang'])
+        && request.resource.data.keys().hasOnly(['pid', 'subs', 'tokens', 'lang', 'keyring'])
+        // Encryption keyring (wrapped keys only; see src/keys.ts).
+        && (!('keyring' in request.resource.data) || (request.resource.data.keyring is map && request.resource.data.keyring.size() <= 8))
         && (!('lang' in request.resource.data) || request.resource.data.lang in ['en', 'de'])
         && request.resource.data.pid is string
         && request.resource.data.subs is list && request.resource.data.subs.size() <= 20
@@ -64,16 +68,23 @@ service cloud.firestore {
       allow update: if signedIn()
         && resource.data.ownerUid == request.auth.uid
         && request.resource.data.ownerUid == resource.data.ownerUid
-        && validSchedule(request.resource.data);
+        && (validSchedule(request.resource.data)
+          // Profile without a schedule yet: only the share-key wrap may be added (sharing password set first).
+          || (request.resource.data.keys().hasOnly(['ownerUid', 'shareKeyWrap'])
+            && request.resource.data.shareKeyWrap is string && request.resource.data.shareKeyWrap.size() <= 512));
       allow delete: if signedIn() && resource.data.ownerUid == request.auth.uid;
       allow read: if signedIn() && (resource.data.ownerUid == request.auth.uid
         || exists(/databases/$(database)/documents/users/$(pid)/subscribers/$(request.auth.uid)));
 
+      // { key: sha256("<pid>:<password>"), password }: owner only. The plain password lets the owner look it up again;
+      // followers only ever present the key.
       match /private/auth {
         allow read, delete: if ownsUser(pid);
         allow create, update: if ownsUser(pid)
-          && request.resource.data.keys().hasOnly(['key'])
-          && request.resource.data.key is string && request.resource.data.key.size() == 64;
+          && request.resource.data.keys().hasOnly(['key', 'password'])
+          && request.resource.data.key is string && request.resource.data.key.size() == 64
+          // The owner's copy of the password, encrypted with their data key (v1:…).
+          && (!('password' in request.resource.data) || (request.resource.data.password is string && request.resource.data.password.size() <= 512));
       }
 
       // Daily notes: "shared" is readable by followers, "private" only by the owner.

@@ -1,7 +1,7 @@
 // Unit tests for shared/schedule.ts. Usage: node scripts/test-schedule.ts
 import {
-  addDays, appointmentTime, diffDays, isTaken, lateTime, nextLateAt, nextNoticeAt, nextPackStart, nextReminderAt, noticesAt,
-  packsLeft, refillTime, reminderTimes, slot, weekday, zonedTime, type Plan,
+  addDays, appointmentTime, diffDays, firstEditableDay, isTaken, lateTime, nextLateAt, nextNoticeAt, nextPackStart, nextReminderAt, noticesAt,
+  packsLeft, refillTime, reminderTimes, slot, trackFromPackStart, weekday, zonedTime, type Plan,
 } from "../shared/schedule.ts";
 
 let failures = 0;
@@ -82,6 +82,20 @@ eq("next notice is the earlier of both", iso(nextNoticeAt(appt, at("2026-10-19T1
 eq("after the appointment notice comes the refill", iso(nextNoticeAt(appt, at("2026-11-02T19:00:00Z"))), "2026-11-26T19:00:00.000Z");
 eq("noticesAt identifies the kind", noticesAt(appt, at("2026-11-02T19:00:00Z")), ["appointment"]);
 eq("no notices without supply/appointment", nextNoticeAt(base, at("2026-10-19T10:00:00Z")), null);
+
+// Editing the pills that were taken before the setup: tracking began mid-pack on 2026-10-05 (pill 5 of 21).
+const mid: Plan = { ...base, trackingSince: "2026-10-05", takenDays: { "2026-10-05": "20:10" } };
+eq("first editable day is the start of the tracking pack", firstEditableDay(mid), "2026-10-01");
+const tracked = trackFromPackStart(mid);
+eq("pre-setup pills become marks without a time", [1, 2, 3, 4].map((n) => tracked.takenDays[`2026-10-0${n}`]), ["", "", "", ""]);
+eq("existing mark is kept", tracked.takenDays["2026-10-05"], "20:10");
+eq("tracking now starts at the pack start", tracked.trackingSince, "2026-10-01");
+eq("every day keeps its state", ["2026-09-30", "2026-10-02", "2026-10-04", "2026-10-05", "2026-10-06"].map((d) => isTaken(tracked, d) === isTaken(mid, d)), [true, true, true, true, true]);
+eq("idempotent", JSON.stringify(trackFromPackStart(tracked)), JSON.stringify(tracked));
+eq("nothing to materialize when tracking began on a pack start", trackFromPackStart(base) === base, true);
+const unmarked: Plan = { ...tracked, takenDays: Object.fromEntries(Object.entries(tracked.takenDays).filter(([d]) => d !== "2026-10-03")) };
+eq("an unmarked pre-setup pill now counts as missed", isTaken(unmarked, "2026-10-03"), false);
+eq("break days before tracking stay unmarked", Object.keys(trackFromPackStart({ ...base, trackingSince: "2026-10-24", packStart: "2026-10-01" }).takenDays).includes("2026-10-22"), false);
 
 console.log(failures ? `\n${failures} FAILED` : "\nAll schedule tests passed.");
 process.exit(failures ? 1 : 0);

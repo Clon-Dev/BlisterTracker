@@ -36,6 +36,9 @@ export function openSheet<T>(render: (done: (value?: T) => void) => React.ReactN
   });
 }
 
+/** Whether a sheet is open (the mascot keeps quiet meanwhile). */
+export const useSheetOpen = () => useSyncExternalStore(sheets.subscribe, () => sheets.get().length > 0, () => sheets.get().length > 0);
+
 export function SheetHost() {
   const entries = useSyncExternalStore(sheets.subscribe, sheets.get, sheets.get);
   const themeVersion = useThemeVersion();

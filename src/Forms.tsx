@@ -4,7 +4,7 @@ import { ArrowRight, BellRing, Check, CheckCircle2, Hash, KeyRound, Lock, Messag
 import { LinearGradient } from "expo-linear-gradient";
 import { addDays, clock, dayKey, slot, type Plan } from "../shared/schedule";
 import { Blister } from "./Blister";
-import { deviceTz, hasSchedule, normalizeId, REMINDER_TEXT_MAX, saveSchedule, setPassword, subscribe, textLength, type Profile } from "./data";
+import { deviceTz, hasSchedule, normalizeId, prepareSharingPassword, REMINDER_TEXT_MAX, saveSchedule, subscribe, textLength, type Profile } from "./data";
 import { useI18n, type Strings } from "./i18n";
 import { packCells } from "./pack";
 import { alert, toast } from "./sheets";
@@ -13,17 +13,24 @@ import { C, F, G, R, shadow, themedStyles } from "./theme";
 import { errorText, queued } from "./errors";
 import { Button, Card, ChipGroup, Field, Header, s, Stepper, Toggle } from "./ui";
 
-export function PasswordForm({ pid, hasPassword, onSaved, onBack }: { pid: string; hasPassword: boolean; onSaved: () => void; onBack: () => void }) {
+export function PasswordForm({ uid, pid, hasPassword, onSaved, onBack }: { uid: string; pid: string; hasPassword: boolean; onSaved: (password: string) => void; onBack: () => void }) {
   const { t } = useI18n();
   const [password, setPw] = useState("");
   const [repeat, setRepeat] = useState("");
+  const [busy, setBusy] = useState(false);
   const valid = password.length >= 6 && password === repeat;
 
-  const save = () => {
-    if (!valid) return;
-    queued(setPassword(pid, password));
-    toast(t.passwordSaved);
-    onSaved();
+  const save = async () => {
+    if (!valid || busy) return;
+    setBusy(true);
+    try {
+      queued((await prepareSharingPassword(uid, pid, password))()); // confirmed once the keys are ready; the write itself may wait for the network
+      toast(t.passwordSaved);
+      onSaved(password);
+    } catch (e) {
+      alert(t.errorTitle, errorText(e));
+      setBusy(false);
+    }
   };
 
   return (
@@ -33,7 +40,7 @@ export function PasswordForm({ pid, hasPassword, onSaved, onBack }: { pid: strin
         <Field label={t.passwordLabel} icon={Lock} value={password} onChangeText={setPw} secureTextEntry autoCapitalize="none" autoComplete="new-password" />
         <Field label={t.passwordRepeat} icon={Lock} value={repeat} onChangeText={setRepeat} secureTextEntry autoCapitalize="none" autoComplete="new-password"
           onSubmitEditing={save} error={repeat.length > 0 && password !== repeat ? t.passwordMismatch : null} />
-        <Button title={t.passwordSave} icon={KeyRound} onPress={save} disabled={!valid} style={{ marginTop: 22 }} />
+        <Button title={t.passwordSave} icon={KeyRound} onPress={save} disabled={!valid} busy={busy} style={{ marginTop: 22 }} />
       </Card>
     </View>
   );

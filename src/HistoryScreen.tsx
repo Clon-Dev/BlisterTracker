@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { ChevronLeft, ChevronRight } from "lucide-react-native";
-import { addDays, dayKey, isTaken, slot, weekday } from "../shared/schedule";
+import { addDays, dayKey, firstEditableDay, isTaken, slot, weekday } from "../shared/schedule";
 import type { Note, Schedule } from "./data";
 import { NoteLine, openNoteSheet, type OwnNote } from "./HomeCards";
 import { formatDay, formatMonth, useI18n } from "./i18n";
@@ -14,8 +14,8 @@ type Status = "taken" | "missed" | "break" | "open" | "untracked";
  * Month calendar of a schedule plus the month's notes. Owner only (`ownerPid`/`onEditDay`): correct days and edit notes;
  * followers see the shared notes.
  */
-export function HistoryScreen({ schedule, notes, ownerPid, onEditDay, onBack }: {
-  schedule: Schedule; notes: Record<string, Note | OwnNote>; ownerPid?: string; onEditDay?: (day: string) => void; onBack: () => void;
+export function HistoryScreen({ schedule, notes, owner, onEditDay, onBack }: {
+  schedule: Schedule; notes: Record<string, Note | OwnNote>; owner?: { uid: string; pid: string }; onEditDay?: (day: string) => void; onBack: () => void;
 }) {
   const { t, lang } = useI18n();
   const today = dayKey(Date.now(), schedule.tz);
@@ -23,15 +23,25 @@ export function HistoryScreen({ schedule, notes, ownerPid, onEditDay, onBack }: 
 
   const first = `${month.year}-${String(month.month + 1).padStart(2, "0")}-01`;
   const days = Array.from({ length: 31 }, (_, i) => addDays(first, i)).filter((d) => d.slice(0, 7) === first.slice(0, 7));
+  // Pills of the pack in which tracking started, before the setup day: the setup said they were taken
+  // (the blister shows them popped), so the history shows them as taken too, without a time. They can be
+  // corrected like any other day.
+  const editableFrom = firstEditableDay(schedule);
   const status = (day: string): Status => {
-    if (day < schedule.trackingSince) return "untracked";
-    if (slot(schedule, day).kind === "break") return "break";
+    if (day in schedule.takenDays) return "taken"; // a marked day always shows, even if it now falls into a break
+    const kind = slot(schedule, day).kind;
+    if (day < schedule.trackingSince) return kind !== "break" && day >= editableFrom ? "taken" : "untracked";
+    if (kind === "break") return "break";
     if (isTaken(schedule, day)) return "taken";
     return day < today ? "missed" : "open";
   };
   // Today only counts once it's marked; until then its pill is still due, not missed.
-  const counted = days.filter((d) => (d < today || (d === today && isTaken(schedule, d))) && d >= schedule.trackingSince && slot(schedule, d).kind !== "break");
-  const takenCount = counted.filter((d) => isTaken(schedule, d)).length;
+  const counted = days.filter((d) => { const st = status(d); return st === "taken" || st === "missed"; });
+  const takenCount = counted.filter((d) => status(d) === "taken").length;
+  // Fixed weeks of 7 (a wrapping row of 1/7-wide cells can round into 6 per row and shift the weekdays).
+  const cells: (string | null)[] = [...Array(weekday(first)).fill(null), ...days];
+  while (cells.length % 7) cells.push(null);
+  const weeks = Array.from({ length: cells.length / 7 }, (_, w) => cells.slice(w * 7, w * 7 + 7));
   const rate = counted.length ? takenCount / counted.length : 0;
   const monthNotes = days.filter((d) => notes[d]).reverse();
 
@@ -68,13 +78,15 @@ export function HistoryScreen({ schedule, notes, ownerPid, onEditDay, onBack }: 
         <View style={{ flexDirection: "row", marginTop: 16 }}>
           {t.weekdays.map((w) => <Text key={w} style={[s.eyebrow, st.col, { textAlign: "center", letterSpacing: 0.4 }]}>{w}</Text>)}
         </View>
-        <View style={{ flexDirection: "row", flexWrap: "wrap", marginTop: 6 }}>
-          {Array.from({ length: weekday(first) }, (_, i) => <View key={`pad${i}`} style={st.col} />)}
-          {days.map((day) => {
+        <View style={{ marginTop: 6 }}>
+          {weeks.map((week, w) => (
+          <View key={w} style={{ flexDirection: "row" }}>
+          {week.map((day, i) => {
+            if (!day) return <View key={`pad${i}`} style={st.col} />;
             const stt = status(day);
             const placebo = slot(schedule, day).kind === "placebo";
-            const time = stt === "taken" ? schedule.takenDays[day] : undefined;
-            const editable = !!onEditDay && day <= today && day >= schedule.trackingSince && stt !== "break";
+            const time = stt === "taken" ? schedule.takenDays[day] || "✓" : undefined;
+            const editable = !!onEditDay && day <= today && day >= editableFrom && stt !== "break";
             return (
               <Pressable key={day} onPress={() => onEditDay?.(day)} disabled={!editable} accessibilityRole="button"
                 accessibilityLabel={`${formatDay(day, lang)}: ${stt === "taken" ? t.legendTaken : stt === "missed" ? t.legendMissed : stt === "break" ? t.legendBreak : ""}`}
@@ -91,6 +103,8 @@ export function HistoryScreen({ schedule, notes, ownerPid, onEditDay, onBack }: 
               </Pressable>
             );
           })}
+          </View>
+          ))}
         </View>
         <View style={st.legend}>
           {([["taken", t.legendTaken], ["missed", t.legendMissed], ["break", t.legendBreak]] as const).map(([k, label]) => (
@@ -111,8 +125,8 @@ export function HistoryScreen({ schedule, notes, ownerPid, onEditDay, onBack }: 
           const note = notes[day];
           const own = "shared" in note ? (note as OwnNote) : null;
           const line = <NoteLine note={note} label={formatDay(day, lang)} badge={own ? (own.shared ? t.sharedBadge : t.privateBadge) : undefined} />;
-          return ownerPid
-            ? <Pressable key={day} onPress={() => openNoteSheet(ownerPid, day, own, lang)} accessibilityRole="button" accessibilityLabel={formatDay(day, lang)}>{line}</Pressable>
+          return owner
+            ? <Pressable key={day} onPress={() => openNoteSheet(owner.uid, owner.pid, day, own, lang)} accessibilityRole="button" accessibilityLabel={formatDay(day, lang)}>{line}</Pressable>
             : <View key={day}>{line}</View>;
         })}
       </Card>
@@ -128,7 +142,7 @@ const Stat = ({ color, label, n }: { color: string; label: string; n: number }) 
 );
 
 const st = themedStyles(() => ({
-  col: { width: `${100 / 7}%` },
+  col: { flex: 1 },
   day: { width: 38, height: 38, borderRadius: 19, alignItems: "center", justifyContent: "center" },
   today: { borderWidth: 2.5, borderColor: C.primary },
   noteDot: { position: "absolute", top: 1, right: 1, width: 8, height: 8, borderRadius: 4, backgroundColor: C.primary, borderWidth: 1.5, borderColor: C.card },

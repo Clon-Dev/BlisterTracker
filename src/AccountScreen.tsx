@@ -2,26 +2,31 @@ import { useState } from "react";
 import { Platform, Pressable, Text, View } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import type { User } from "firebase/auth";
-import { AlertCircle, BadgeCheck, ChevronRight, KeyRound, Lock, LogOut, Mail, MailWarning, RefreshCw, SunMoon, Trash2, type LucideIcon } from "lucide-react-native";
+import { AlertCircle, BadgeCheck, Cat, ChevronRight, KeyRound, LifeBuoy, Lock, LogOut, Mail, MailWarning, RefreshCw, ShieldCheck, SunMoon, Trash2, type LucideIcon } from "lucide-react-native";
 import { authErrorText, changeEmail, changePassword, deleteAccount, logout, resendVerification } from "./auth";
 import { deleteAccountData, removeToken, type Account } from "./data";
+import { openRecoveryCodeSheet } from "./EncryptionScreens";
+import { forgetKey, regenerateRecoveryCode, rewrapForPassword } from "./keys";
 import { useI18n } from "./i18n";
+import { setMascotSettings, useMascotSettings } from "./mascot/store";
 import { confirm, openSheet, SheetIcon, toast } from "./sheets";
 import { checkForUpdate, currentVersion, type Release } from "./update";
 import { C, F, G, R, setAppearance, themedStyles, useAppearance, type Appearance } from "./theme";
-import { Badge, Button, Card, ChipGroup, Field, Header, s } from "./ui";
+import { Badge, Button, Card, ChipGroup, Field, Header, s, Toggle } from "./ui";
 
 export function AccountScreen({ user, account, pushToken, onBack, onUpdateFound }: {
   user: User; account: Account; pushToken: string | null; onBack: () => void; onUpdateFound: (r: Release) => void;
 }) {
   const { t } = useI18n();
   const appearance = useAppearance();
+  const mascot = useMascotSettings();
 
   const signOutDevice = async () => {
     if (!(await confirm({ title: t.logoutTitle, message: t.logoutBody, confirmLabel: t.logout, icon: LogOut }))) return;
     // Detach this device's push token first (needs the login). Offline, the write can't be confirmed,
     // so don't wait for it forever; the worker also prunes tokens that stop working.
     if (pushToken) await Promise.race([removeToken(user.uid, pushToken), new Promise((r) => setTimeout(r, 4000))]);
+    await forgetKey(user.uid); // the unlocked key doesn't stay on a logged-out device
     await logout();
   };
 
@@ -57,9 +62,23 @@ export function AccountScreen({ user, account, pushToken, onBack, onUpdateFound 
         ]} />
       </Card>
 
+      <Card>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+          <Cat size={19} color={C.primaryDeep} strokeWidth={2.3} />
+          <Text style={[s.body, F.bold]}>{t.mascotSettings}</Text>
+        </View>
+        <Toggle label={t.mascotShow} value={mascot.enabled} onChange={(enabled) => setMascotSettings({ enabled })} />
+        {mascot.enabled && <Toggle label={t.mascotFacts} value={mascot.facts} onChange={(facts) => setMascotSettings({ facts })} />}
+        <Text style={[s.small, { marginTop: 12 }]}>{t.mascotDisclaimer}</Text>
+      </Card>
+
       <Card style={{ padding: 6 }}>
         <Row icon={Mail} title={t.changeEmail} onPress={() => openSheet((done) => <ChangeEmailSheet user={user} done={done} />)} />
         <Row icon={KeyRound} title={t.changeAccountPassword} onPress={() => openSheet((done) => <ChangePasswordSheet user={user} done={done} />)} />
+        <Row icon={LifeBuoy} title={t.newRecoveryCode} onPress={async () => {
+          if (!(await confirm({ title: t.newRecoveryCode, message: t.newRecoveryCodeBody, confirmLabel: t.newRecoveryCode, icon: LifeBuoy }))) return;
+          openRecoveryCodeSheet(await regenerateRecoveryCode(user.uid));
+        }} />
         <Row icon={LogOut} title={t.logout} onPress={signOutDevice} last />
       </Card>
 
@@ -75,7 +94,11 @@ export function AccountScreen({ user, account, pushToken, onBack, onUpdateFound 
         <Row icon={Trash2} title={t.deleteAccount} danger last
           onPress={() => openSheet((done) => <DeleteSheet user={user} account={account} done={done} />)} />
       </Card>
-      <Text style={[s.small, { textAlign: "center", marginTop: 18, color: C.muted }]}>
+      <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, marginTop: 18 }}>
+        <ShieldCheck size={14} color={C.success} strokeWidth={2.4} />
+        <Text style={[s.small, { color: C.muted, flexShrink: 1 }]}>{t.encryptedInfo}</Text>
+      </View>
+      <Text style={[s.small, { textAlign: "center", marginTop: 6, color: C.muted }]}>
         Blister Buddy {t.versionLabel({ version: currentVersion().version, code: currentVersion().code })}
       </Text>
     </View>
@@ -156,6 +179,7 @@ function ChangePasswordSheet({ user, done }: { user: User; done: () => void }) {
       {errorBox}
       <Button title={t.changeAccountPassword} disabled={!valid} busy={busy} style={{ marginTop: 22 }} onPress={() => run(async () => {
         await changePassword(user, current, next);
+        await rewrapForPassword(user.uid, next); // encrypted data stays readable with the new password
         done();
         toast(t.passwordChanged);
       })} />
@@ -176,6 +200,7 @@ function DeleteSheet({ user, account, done }: { user: User; account: Account; do
       {errorBox}
       <Button title={t.deleteAccount} kind="danger" icon={Trash2} disabled={!password} busy={busy} style={{ marginTop: 22 }} onPress={() => run(async () => {
         await deleteAccount(user, password, () => deleteAccountData(user.uid, account));
+        await forgetKey(user.uid);
         done();
       })} />
     </View>

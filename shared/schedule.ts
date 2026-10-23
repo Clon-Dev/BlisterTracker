@@ -140,6 +140,22 @@ export function nextNoticeAt(p: Plan, after: number) {
 }
 export const isTaken = (p: Plan, day: string) => day in p.takenDays || day < p.trackingSince;
 
+/** First day whose pill can still be corrected: the start of the pack in which tracking began. */
+export const firstEditableDay = (p: Plan) => slot(p, p.trackingSince).packStart;
+
+/**
+ * The setup said the pills of that first pack before the setup day were taken (the blister shows them popped,
+ * without marks). To correct one of them they become explicit marks (time unknown) and tracking starts at the
+ * pack start. Every day keeps its state; idempotent.
+ */
+export function trackFromPackStart(p: Plan): Plan {
+  const from = firstEditableDay(p);
+  if (from >= p.trackingSince) return p;
+  const takenDays = { ...p.takenDays };
+  for (let d = from; d < p.trackingSince; d = addDays(d, 1)) if (isPillDay(p, d) && !(d in takenDays)) takenDays[d] = "";
+  return { ...p, takenDays, trackingSince: from };
+}
+
 // ---------- Notification moments ----------
 
 /** Owner reminder instants on `day`: the reminder and its repeats (same local day only); none if not due. */

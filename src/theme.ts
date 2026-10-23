@@ -183,12 +183,15 @@ export function themedStyles<S extends Styles>(factory: () => S & Styles): Reado
 }
 
 /** Each weight is its own font file (Android ignores fontWeight for custom fonts). */
+// On the web a family list works, so a clean system sans-serif shows until (or if) the font file arrives.
+const fallback = Platform.OS === "web" ? ", system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" : "";
+const family = (name: string): TextStyle => ({ fontFamily: name + fallback });
 export const F: Record<"regular" | "medium" | "semibold" | "bold" | "extrabold", TextStyle> = {
-  regular: { fontFamily: "PlusJakartaSans_400Regular" },
-  medium: { fontFamily: "PlusJakartaSans_500Medium" },
-  semibold: { fontFamily: "PlusJakartaSans_600SemiBold" },
-  bold: { fontFamily: "PlusJakartaSans_700Bold" },
-  extrabold: { fontFamily: "PlusJakartaSans_800ExtraBold" },
+  regular: family("PlusJakartaSans_400Regular"),
+  medium: family("PlusJakartaSans_500Medium"),
+  semibold: family("PlusJakartaSans_600SemiBold"),
+  bold: family("PlusJakartaSans_700Bold"),
+  extrabold: family("PlusJakartaSans_800ExtraBold"),
 };
 
 export const R = { sm: 12, md: 16, lg: 22, xl: 28, full: 999 };
