@@ -23,23 +23,28 @@ export async function enablePush(): Promise<string | null> {
   return getToken(getMessaging(app), { vapidKey, serviceWorkerRegistration: registration });
 }
 
-/** The service worker shows the button itself (title comes with the push). */
-export async function registerTakenAction(_buttonTitle: string) {}
+export type NotificationAction = "taken" | "seen";
+export type ActionTitles = { taken: string; done: string; seen: string };
+
+/** The service worker shows the buttons itself (titles come with the push). */
+export async function registerActions(_titles: ActionTitles) {}
 
 /**
- * Calls `cb(pid, day)` when the "Taken" button was pressed: the service worker either messages an open
- * window or opens the app with ?taken=<day>&pid=<pid>. (iPhone home-screen apps show no buttons.)
+ * Calls `cb(action, pid, day)` when a notification button ("Taken" or "Mark as seen") was pressed: the service worker
+ * either messages an open window or opens the app with ?taken=<day>&pid=<pid> or ?seen=…. (iPhone home-screen apps show no buttons.)
  */
-export function onTakenAction(cb: (pid: string, day: string) => void) {
+export function onNotificationAction(cb: (action: NotificationAction, pid: string, day: string) => void) {
   const params = new URLSearchParams(window.location.search);
-  const day = params.get("taken");
   const pid = params.get("pid");
-  if (day && pid) {
-    window.history.replaceState(null, "", window.location.pathname);
-    cb(pid, day);
+  for (const action of ["taken", "seen"] as const) {
+    const day = params.get(action);
+    if (day && pid) {
+      window.history.replaceState(null, "", window.location.pathname);
+      cb(action, pid, day);
+    }
   }
   const onMessage = (e: MessageEvent) => {
-    if (e.data?.type === "taken") cb(e.data.pid, e.data.day);
+    if (e.data?.type === "taken" || e.data?.type === "seen") cb(e.data.type, e.data.pid, e.data.day);
   };
   navigator.serviceWorker?.addEventListener("message", onMessage);
   return () => navigator.serviceWorker?.removeEventListener("message", onMessage);

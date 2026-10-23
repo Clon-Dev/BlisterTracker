@@ -4,7 +4,7 @@ import { Pressable, Text, TextInput, View, type TextInputInstance } from "react-
 import {
   CalendarClock, Check, ChevronRight, Download, Globe2, NotebookPen, Package, SkipForward, Stethoscope, Trash2, type LucideIcon,
 } from "lucide-react-native";
-import { addDays, clock, isTaken, packsLeft, zonedTime } from "../shared/schedule";
+import { addDays, clock, isTaken, methodOf, packsLeft, zonedTime } from "../shared/schedule";
 import { DatePicker } from "./DatePicker";
 import { appointmentNoteOf, MOODS, setAppointment, setNote, setSupply, startPackEarly, todayOf, type Note, type Schedule } from "./data";
 import { queued } from "./errors";
@@ -24,13 +24,18 @@ export function SuppliesCard({ pid, schedule }: { pid: string; schedule: Schedul
   const left = packsLeft(schedule, today);
   const unopened = left === null ? null : Math.max(0, left - 1);
   const appointment = schedule.appointmentDay && schedule.appointmentDay >= today ? schedule.appointmentDay : null;
+  const method = methodOf(schedule);
+  const pill = method === "pill";
   return (
     <Card style={{ padding: 6 }}>
-      <InfoRow icon={Package} tone={unopened === 0 ? "danger" : "primary"}
-        title={unopened === null ? t.supplyNone : t.supplyLeft({ n: unopened })}
-        subtitle={unopened === null ? t.supplyAction : unopened === 0 ? t.supplyRefill : t.supplyHint}
-        onPress={() => openSheet((done) => <SupplySheet pid={pid} schedule={schedule} unopened={unopened} done={done} />)} />
-      <View style={st.divider} />
+      {/* The injection is given at the practice: no supply to track. */}
+      {method !== "injection" && <>
+        <InfoRow icon={Package} tone={unopened === 0 ? "danger" : "primary"}
+          title={unopened === null ? (pill ? t.supplyNone : t.supplyNoneMethod) : (pill ? t.supplyLeft : t.supplyLeftMethod)({ n: unopened })}
+          subtitle={unopened === null ? (pill ? t.supplyAction : t.supplyActionMethod) : unopened === 0 ? t.supplyRefill : pill ? t.supplyHint : t.supplyHintMethod}
+          onPress={() => openSheet((done) => <SupplySheet pid={pid} schedule={schedule} unopened={unopened} done={done} />)} />
+        <View style={st.divider} />
+      </>}
       <InfoRow icon={Stethoscope} tone="primary"
         title={appointment ? t.appointmentOn({ date: formatDay(appointment, lang) }) : t.appointmentNone}
         subtitle={appointment ? (appointmentNoteOf(schedule) ?? t.lockedNote) || t.appointmentHint : t.appointmentAction}
@@ -60,11 +65,14 @@ function InfoRow({ icon: Icon, tone, title, subtitle, onPress }: {
 function SupplySheet({ pid, schedule, unopened, done }: { pid: string; schedule: Schedule; unopened: number | null; done: () => void }) {
   const { t } = useI18n();
   const [n, setN] = useState(unopened ?? 2);
+  const method = methodOf(schedule);
   return (
     <View>
       <SheetIcon icon={Package} />
-      <Text style={s.h1}>{t.supplySheetTitle}</Text>
-      <Text style={[s.muted, { marginTop: 8 }]}>{t.supplySheetBody}</Text>
+      <Text style={s.h1}>{method === "pill" ? t.supplySheetTitle : t.supplySheetTitleMethod}</Text>
+      <Text style={[s.muted, { marginTop: 8 }]}>
+        {method === "patch" ? t.supplySheetBodyPatch({ n: schedule.pillsPerPack / 7 }) : method === "ring" ? t.supplySheetBodyRing : t.supplySheetBody}
+      </Text>
       <Stepper value={n} min={0} max={23} onChange={setN} />
       <Button title={t.save} icon={Check} style={{ marginTop: 22 }} onPress={() => { queued(setSupply(pid, schedule, n)); done(); toast(t.saved); }} />
       {unopened !== null && <LinkButton title={t.stopTracking} color={C.textSoft} onPress={() => { queued(setSupply(pid, schedule, null)); done(); }} />}

@@ -4,7 +4,7 @@
 import { createHash } from "node:crypto";
 import { initializeApp, deleteApp } from "firebase/app";
 import { getAuth, deleteUser, createUserWithEmailAndPassword } from "firebase/auth";
-import { getFirestore, doc, setDoc, getDoc, updateDoc, deleteDoc, deleteField, collection, getDocs, Timestamp, terminate, writeBatch } from "firebase/firestore";
+import { getFirestore, doc, setDoc, getDoc, updateDoc, deleteDoc, deleteField, collection, getDocs, serverTimestamp, Timestamp, terminate, writeBatch } from "firebase/firestore";
 
 const config = {
   apiKey: process.env.EXPO_PUBLIC_FIREBASE_API_KEY,
@@ -55,10 +55,63 @@ try {
   await expect("alice cannot add other fields to a schedule-less profile", false, () => updateDoc(doc(alice.db, "users", A), { evil: true }));
   await expect("bob cannot read alice's account", false, () => getDoc(doc(bob.db, "accounts", alice.user.uid)));
   await expect("alice saves a valid schedule", true, () => setDoc(doc(alice.db, "users", A), schedule));
+  // Usernames: unique (case-insensitive), changeable, only for the own profile.
+  // As usernameKey in src/data.ts: lowercased letter by letter.
+  const ukey = (u) => [...u].map((c) => { const l = c.toLowerCase(); return [...l].length === 1 ? l : c; }).join("").replace(/%/g, "%25").replace(/\//g, "%2F");
+  const claim = (c, pid, name, previous) => {
+    const batch = writeBatch(c.db);
+    if (previous && ukey(previous) !== ukey(name)) batch.delete(doc(c.db, "usernames", ukey(previous)));
+    batch.set(doc(c.db, "usernames", ukey(name)), { pid, ownerUid: c.user.uid, username: name });
+    batch.update(doc(c.db, "users", pid), { username: name, usernameKey: ukey(name) });
+    return batch.commit();
+  };
+  await expect("alice claims the username Alice_93", true, () => claim(alice, A, "Alice_93"));
+  await expect("bob cannot take it with other capitals", false, () => claim(bob, B, "ALICE_93"));
+  await expect("bob cannot point a username at alice's profile", false, () => setDoc(doc(bob.db, "usernames", "bobs-fake"), { pid: A, ownerUid: bob.user.uid, username: "bobs-fake" }));
+  await expect("bob cannot show a username he doesn't hold", false, () => updateDoc(doc(bob.db, "users", B), { username: "Alice_93" }));
+  await expect("bob cannot claim a 1-character username", false, () => claim(bob, B, "b"));
+  await expect("bob cannot claim a 25-character username", false, () => claim(bob, B, "b".repeat(25)));
+  await expect("bob cannot claim a username with emoji", false, () => claim(bob, B, "bob😺"));
+  await expect("bob cannot claim “..”", false, () => claim(bob, B, ".."));
+  let held; // bob's current username (each claim frees only a name he really holds)
+  const bobClaims = async (name) => { await claim(bob, B, name, held); held = name; };
+  for (const [name, other] of [["xy", "XY"], ["x".repeat(24), null], ["Jörg_Ünal", "JÖRG_üNAL"], ["Иван_Петров", "иван_петров"], ["さくら・サクラ", null], ["ΣΟΦΙΑ", "σοφια"], ["Łódź", "ŁÓDŹ"], ["İstanbul", null]]) {
+    await expect(`bob claims “${name}”`, true, () => bobClaims(name));
+    if (other && held === name) await expect(`alice can't take it as “${other}”`, false, () => claim(alice, A, other, "ALICE_93"));
+  }
+  await expect("bob changes to “b/o/b~!?#”", true, () => bobClaims("b/o/b~!?#"));
+  await expect("bob cannot claim a username with a space", false, () => claim(bob, B, "bob smith"));
+  await expect("bob cannot file a username under another key", false, () => setDoc(doc(bob.db, "usernames", "something"), { pid: B, ownerUid: bob.user.uid, username: "bob.smith" }));
+  await expect("bob renames himself (the old name is freed)", true, () => claim(bob, B, "Bobby!!", "b/o/b~!?#"));
+  await expect("the old name is free again", true, async () => {
+    if ((await getDoc(doc(alice.db, "usernames", ukey("b/o/b~!?#")))).exists()) throw new Error("still taken");
+  });
+  await expect("alice changes only the capitals of her username", true, () => claim(alice, A, "ALICE_93", "Alice_93"));
+  await expect("anyone signed in can look up a username", true, async () => {
+    const d = await getDoc(doc(bob.db, "usernames", ukey("alice_93")));
+    if (d.data()?.pid !== A) throw new Error("wrong pid");
+  });
+  await expect("bob cannot delete alice's username", false, () => deleteDoc(doc(bob.db, "usernames", ukey("alice_93"))));
+  await expect("alice cannot remove the username from her profile", false, () => updateDoc(doc(alice.db, "users", A), { username: deleteField() }));
+  await expect("alice cannot point her profile at bob's entry", false, () => updateDoc(doc(alice.db, "users", A), { username: "b/o/b~!?#", usernameKey: ukey("b/o/b~!?#") }));
+  await expect("a 1.4.0-style rename (no usernameKey) still works for ASCII names", true, async () => {
+    const batch = writeBatch(alice.db);
+    batch.delete(doc(alice.db, "usernames", ukey("ALICE_93")));
+    batch.set(doc(alice.db, "usernames", ukey("Alice_94")), { pid: A, ownerUid: alice.user.uid, username: "Alice_94" });
+    batch.update(doc(alice.db, "users", A), { username: "Alice_94", usernameKey: deleteField() });
+    await batch.commit();
+  });
+  await expect("back to ALICE_93", true, () => claim(alice, A, "ALICE_93", "Alice_94"));
   await expect("alice cannot have more placebo pills than pills", false, () => updateDoc(doc(alice.db, "users", A), { placebo: 21 }));
   await expect("alice cannot use an unsupported repeat interval", false, () => updateDoc(doc(alice.db, "users", A), { repeatMinutes: 5 }));
   await expect("alice cannot save a malformed pack start", false, () => updateDoc(doc(alice.db, "users", A), { packStart: "15.10.2026" }));
   await expect("alice switches to 24 + 4 placebo with 2 h follower alert", true, () => updateDoc(doc(alice.db, "users", A), { pillsPerPack: 28, placebo: 4, breakDays: 0, lateMinutes: 120 }));
+  await expect("alice switches to the patch with a 1-day follower alert", true, () => updateDoc(doc(alice.db, "users", A), { method: "patch", pillsPerPack: 21, placebo: 0, breakDays: 7, lateMinutes: 60 }));
+  await expect("alice records a patch change done a day late", true, () => updateDoc(doc(alice.db, "users", A), { "takenDays.2026-10-22": "2026-10-23T09:12" }));
+  await expect("alice switches to the 13-week injection", true, () => updateDoc(doc(alice.db, "users", A), { method: "injection", pillsPerPack: 91, breakDays: 0 }));
+  await expect("alice cannot use an unknown method", false, () => updateDoc(doc(alice.db, "users", A), { method: "implant" }));
+  await expect("alice cannot use a longer injection interval", false, () => updateDoc(doc(alice.db, "users", A), { pillsPerPack: 120 }));
+  await expect("alice switches back to the pill (24 + 4)", true, () => updateDoc(doc(alice.db, "users", A), { method: "pill", pillsPerPack: 28, placebo: 4, breakDays: 0, "takenDays.2026-10-22": deleteField() }));
   await expect("alice cannot save a bad time", false, () => updateDoc(doc(alice.db, "users", A), { time: "25:00" }));
   await expect("alice cannot add unknown fields", false, () => updateDoc(doc(alice.db, "users", A), { evil: true }));
   await expect("alice saves supply, appointment, early start and reminder text", true, () => updateDoc(doc(alice.db, "users", A), {
@@ -99,16 +152,35 @@ try {
   await expect("bob cannot modify alice's schedule", false, () => updateDoc(doc(bob.db, "users", A), { "takenDays.2026-10-20": "08:00" }));
   await expect("bob cannot list alice's subscribers", false, () => getDocs(collection(bob.db, "users", A, "subscribers")));
   await expect("alice can list her subscribers", true, () => getDocs(collection(alice.db, "users", A, "subscribers")));
+  // "Seen" confirmations: followers confirm they saw that the pill was taken.
+  const seenBob = () => doc(bob.db, "users", A, "seen", bob.user.uid);
+  await expect("bob (follower) confirms he has seen today's pill", true, () => setDoc(seenBob(), { day: "2026-10-19", at: serverTimestamp(), name: "Bob" }));
+  await expect("bob confirms without a name", true, () => setDoc(seenBob(), { day: "2026-10-19", at: serverTimestamp() }));
+  await expect("bob cannot confirm for someone else", false, () => setDoc(doc(bob.db, "users", A, "seen", "someone-else"), { day: "2026-10-19", at: serverTimestamp() }));
+  await expect("bob cannot backdate a confirmation", false, () => setDoc(seenBob(), { day: "2026-10-19", at: Timestamp.fromMillis(0) }));
+  await expect("bob cannot add other fields to a confirmation", false, () => setDoc(seenBob(), { day: "2026-10-19", at: serverTimestamp(), evil: true }));
+  await expect("bob cannot use a malformed day", false, () => setDoc(seenBob(), { day: "19.10.2026", at: serverTimestamp() }));
+  await expect("alice reads her followers' confirmations", true, async () => {
+    const s = await getDocs(collection(alice.db, "users", A, "seen"));
+    if (s.size !== 1) throw new Error(`expected 1 confirmation, got ${s.size}`);
+  });
+  await expect("alice cannot confirm her own pill (she isn't a follower)", false, () => setDoc(doc(alice.db, "users", A, "seen", alice.user.uid), { day: "2026-10-19", at: serverTimestamp() }));
+  await expect("bob cannot list other followers' confirmations", false, () => getDocs(collection(bob.db, "users", A, "seen")));
   await expect("alice cannot subscribe to herself", false, async () => {
     await setDoc(doc(bob.db, "users", B, "private", "auth"), { key: key(B, "pw1234") }).catch(() => {});
     await setDoc(doc(alice.db, "users", A, "subscribers", alice.user.uid), { key: key(A, "secret1") });
   });
   await expect("bob unsubscribes", true, () => deleteDoc(doc(bob.db, "users", A, "subscribers", bob.user.uid)));
   await expect("bob loses access after unsubscribing", false, () => getDoc(doc(bob.db, "users", A)));
+  await expect("bob cannot confirm after unfollowing", false, () => setDoc(seenBob(), { day: "2026-10-20", at: serverTimestamp() }));
+  await expect("bob deletes his confirmation when unfollowing", true, () => deleteDoc(seenBob()));
   await expect("bob re-follows alice", true, () => setDoc(doc(bob.db, "users", A, "subscribers", bob.user.uid), { key: key(A, "secret1") }));
+  await expect("bob confirms again after re-following", true, () => setDoc(seenBob(), { day: "2026-10-21", at: serverTimestamp() }));
   await expect("alice deletes all her data in one batch (account deletion)", true, async () => {
     const batch = writeBatch(alice.db);
     (await getDocs(collection(alice.db, "users", A, "subscribers"))).forEach((d) => batch.delete(d.ref));
+    (await getDocs(collection(alice.db, "users", A, "seen"))).forEach((d) => batch.delete(d.ref));
+    batch.delete(doc(alice.db, "usernames", ukey("alice_93")));
     batch.delete(doc(alice.db, "users", A, "private", "auth"));
     batch.delete(doc(alice.db, "users", A, "notes", "shared"));
     batch.delete(doc(alice.db, "users", A, "notes", "private"));
@@ -122,6 +194,11 @@ try {
   });
 } finally {
   // Cleanup: subcollections first, then profiles, accounts and the test logins.
+  await deleteDoc(doc(bob.db, "users", A, "seen", bob.user.uid)).catch(() => {});
+  // Free every name the test may hold (also after a failure), so no orphaned usernames remain.
+  const ukeyAll = (u) => [...u].map((c) => { const l = c.toLowerCase(); return [...l].length === 1 ? l : c; }).join("").replace(/%/g, "%25").replace(/\//g, "%2F");
+  const testNames = ["Alice_93", "Alice_94", "Bobby!!", "b/o/b~!?#", "xy", "x".repeat(24), "Jörg_Ünal", "Иван_Петров", "さくら・サクラ", "ΣΟΦΙΑ", "Łódź", "İstanbul", "JÖRG_üNAL", "иван_петров", "σοφια", "ŁÓDŹ", "XY"];
+  for (const c of [alice, bob]) for (const n of testNames) await deleteDoc(doc(c.db, "usernames", ukeyAll(n))).catch(() => {});
   await deleteDoc(doc(bob.db, "users", A, "subscribers", bob.user.uid)).catch(() => {});
   await deleteDoc(doc(alice.db, "users", A, "private", "auth")).catch(() => {});
   await deleteDoc(doc(bob.db, "users", B, "private", "auth")).catch(() => {});

@@ -22,6 +22,10 @@ eq("no reminder on break days", kind({ pill: { number: 2, state: "break", minute
 eq("snooze hides the reminder", kind({ pill: { number: 12, state: "overdue", minutesLate: 5 } }, { ...settled, snoozeUntil: NOW + SNOOZE }), null);
 eq("reminder returns after the snooze", kind({ now: NOW + SNOOZE, pill: { number: 12, state: "overdue", minutesLate: 35 } }, { ...settled, snoozeUntil: NOW + SNOOZE }), "reminder");
 eq("reminder beats the greeting", kind({ openedFor: 1000, pill: { number: 12, state: "overdue", minutesLate: 5 } }, freshMemory("2026-10-23")), "reminder");
+eq("a patch reminder names the action", nextMessage({ ...base, pill: { number: 0, state: "overdue", minutesLate: 30, action: "change" } }, settled), { kind: "reminder", number: 0, late: false, action: "change" });
+eq("injection due in 5 days: a heads-up", nextMessage({ ...base, pill: { number: 0, state: "break", minutesLate: 0, soonDays: 5 } }, settled), { kind: "soon", days: 5 });
+eq("…once a day", kind({ pill: { number: 0, state: "break", minutesLate: 0, soonDays: 5 } }, { ...settled, soonSaid: true }), null);
+eq("…not two weeks ahead", kind({ pill: { number: 0, state: "break", minutesLate: 0, soonDays: 12 } }), null);
 eq("hidden for today: silent", kind({ pill: { number: 12, state: "overdue", minutesLate: 5 } }, { ...settled, hidden: true }), null);
 
 // Greeting
@@ -29,7 +33,17 @@ eq("introduces herself on the first greeting", nextMessage({ ...base, hour: 8, o
 eq("later greetings without introduction", nextMessage({ ...base, hour: 8, openedFor: 1000 }, { ...freshMemory("2026-10-23"), introduced: true }), { kind: "greet", part: "morning", intro: false });
 eq("greeting by time of day", (nextMessage({ ...base, hour: 14, openedFor: 1000 }, freshMemory("2026-10-23")) as { part: string }).part, "day");
 eq("no greeting later in the session", kind({ openedFor: 90_000 }, freshMemory("2026-10-23")), null);
-eq("greets once a day", kind({ openedFor: 1000 }), null);
+eq("greets once a day", kind({ openedFor: 1000, hour: 15 }), null);
+eq("first open late at night: the greeting is a good night", (nextMessage({ ...base, hour: 22, openedFor: 1000 }, freshMemory("2026-10-23")) as { part: string }).part, "night");
+
+// Good night
+eq("says good night in the evening", kind({ hour: 21 }), "goodnight");
+eq("not before 21:00", kind({ hour: 20 }), null);
+eq("good night once per evening", kind({ hour: 22 }, { ...settled, saidGoodnight: true }), null);
+eq("the mood question comes before good night", kind({ hour: 22, hasNoteToday: false }), "mood");
+eq("good night waits until the mood question had its turn", kind({ hour: 22, openedFor: 7_000, hasNoteToday: false, pill: { number: 1, state: "taken", minutesLate: 0 } }), "mood");
+eq("no good night in the first seconds", kind({ hour: 22, openedFor: 8_000 }), null);
+eq("good night comes before a fact", kind({ hour: 22, factsEnabled: true }), "goodnight");
 
 // Mood question
 eq("asks how you feel after the pill", kind({ hour: 10, hasNoteToday: false, pill: { number: 12, state: "taken", minutesLate: 0 } }), "mood");
@@ -65,7 +79,7 @@ eq(`asks again on tap ${OFFER_EVERY}`, offersFact(OFFER_EVERY), true);
 
 // Day change
 const next = forDay({ ...m, moodAsked: true, hidden: true, snoozeUntil: 5 }, "2026-10-24");
-eq("new day resets the daily fields", [next.autoFact, next.moodAsked, next.hidden, next.greeted, next.snoozeUntil], [false, false, false, false, 0]);
+eq("new day resets the daily fields", [next.autoFact, next.moodAsked, next.hidden, next.greeted, next.snoozeUntil, !!next.saidGoodnight], [false, false, false, false, 0, false]);
 eq("new day keeps the introduction", forDay({ ...settled, introduced: true }, "2026-10-24").introduced, true);
 eq("new day keeps the shown facts", forDay({ ...settled, seen: [4, 7], lastTopic: "x" }, "2026-10-24").seen, [4, 7]);
 eq("same day: unchanged", forDay(m, m.day) === m, true);

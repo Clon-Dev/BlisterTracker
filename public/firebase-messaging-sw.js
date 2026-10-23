@@ -10,21 +10,23 @@ self.addEventListener("push", (event) => {
   let info = {};
   try { info = JSON.parse(data.body || "{}"); } catch { /* no extra data */ }
   const options = { body: data.message || "", icon: "/icon-192.png", badge: "/icon-192.png", tag: data.tag, data: info };
-  // The owner's reminder gets a "Taken" button (where the browser supports buttons).
-  if (data.categoryId === "reminder") options.actions = [{ action: "taken", title: data.actionTitle || "Taken" }];
+  // The owner's reminder gets a "Taken" button ("Done" for patch, ring, injection; where the browser supports buttons).
+  if (data.categoryId === "reminder" || data.categoryId === "action") options.actions = [{ action: "taken", title: data.actionTitle || "Taken" }];
+  // The followers' "pill taken" notice gets a "Mark as seen" button.
+  if (data.categoryId === "seen") options.actions = [{ action: "seen", title: data.actionTitle || "Mark as seen" }];
   event.waitUntil(self.registration.showNotification(data.title || "Blister Buddy", options));
 });
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const { pid, day } = event.notification.data || {};
-  const taken = event.action === "taken" && pid && day;
+  const action = (event.action === "taken" || event.action === "seen") && pid && day ? event.action : null;
   event.waitUntil(self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((windows) => {
     const open = windows.find((w) => "focus" in w);
     if (open) {
-      if (taken) open.postMessage({ type: "taken", pid, day });
+      if (action) open.postMessage({ type: action, pid, day });
       return open.focus();
     }
-    return self.clients.openWindow(taken ? `/?taken=${day}&pid=${pid}` : "/");
+    return self.clients.openWindow(action ? `/?${action}=${day}&pid=${pid}` : "/");
   }));
 });

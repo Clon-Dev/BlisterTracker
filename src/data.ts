@@ -1,9 +1,9 @@
 import * as Crypto from "expo-crypto";
 import {
-  arrayRemove, arrayUnion, collection, deleteField, doc, getDoc, getDocs, onSnapshot, setDoc, Timestamp, updateDoc, writeBatch,
-  type Unsubscribe,
+  arrayRemove, arrayUnion, collection, deleteField, doc, getDoc, getDocs, onSnapshot, serverTimestamp, setDoc, Timestamp, updateDoc, writeBatch,
+  type DocumentData, type Unsubscribe,
 } from "firebase/firestore";
-import { addDays, dayKey, nextLateAt, nextNoticeAt, nextReminderAt, slot, trackFromPackStart, type Plan } from "../shared/schedule";
+import { addDays, dayKey, methodOf, nextLateAt, nextNoticeAt, nextReminderAt, slot, trackFromPackStart, withAction, type Method, type Plan } from "../shared/schedule";
 import { accessKeyFor, decrypt, encrypt, isEncrypted, type Key } from "./crypto";
 import { db } from "./firebase";
 import {
@@ -28,6 +28,9 @@ export type Schedule = Plan & {
   reminderText?: string;
   /** The schedule's share key, wrapped with the sharing password (followers unwrap it once). */
   shareKeyWrap?: string;
+  /** The owner's username (see usernames below) and its document key; may exist before the first schedule. */
+  username?: string;
+  usernameKey?: string;
 };
 export const REMINDER_TEXT_MAX = 64;
 export const textLength = (text: string) => [...text].length; // code points, so an emoji counts once
@@ -40,17 +43,19 @@ type StoredNote = { enc: string } | Note;
 export type StoredNotes = Record<string, StoredNote>;
 export type Profile = { ownerUid: string } & Partial<Schedule>;
 export type ScheduleInput = Pick<Schedule, "name" | "pillsPerPack" | "placebo" | "breakDays" | "time" | "repeatMinutes" | "lateMinutes"> & {
+  method: Method;
   reminderText: string;
-  /** Position of today's day in the pack (pill index, or a break day after the pills). */
+  /** Position of today's day in the cycle (pill index, or a break day after the pills). */
   todayIndex: number;
-  /** "HH:MM" today's pill was taken, or null if not yet. */
+  /** Start of the current cycle instead of `todayIndex` (the injection: day of the last one). */
+  start?: string;
+  /** "HH:MM" today's pill / patch / ring action was done, or null if not yet. */
   takenTodayAt: string | null;
 };
 
 // No 0/O, 1/I/L: IDs get read out loud and typed on phones.
 const ID_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 const newPersonalId = () => Array.from(Crypto.getRandomBytes(6), (b) => ID_ALPHABET[b % ID_ALPHABET.length]).join("");
-export const normalizeId = (id: string) => id.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
 
 /** Access key from before encryption (fast SHA-256); only tried when an owner hasn't upgraded yet. */
 const legacyAccessKey = (pid: string, password: string) =>
@@ -130,6 +135,26 @@ export const watchProfile = (pid: string, cb: (p: Profile | null) => void, onErr
 export const watchSubscriberCount = (pid: string, cb: (n: number) => void) => resilient((onError) =>
   onSnapshot(collection(db, "users", pid, "subscribers"), (s) => cb(s.size), onError));
 
+// ---------- "Seen" confirmations ----------
+// A follower confirms they've seen that a day's pill was taken (like a read receipt):
+// users/{pid}/seen/{followerUid} = { day, at, name? }, written by the follower, read by the owner.
+
+export type Seen = { day: string; at: number; name: string | null };
+const seenRef = (pid: string, uid: string) => doc(db, "users", pid, "seen", uid);
+const toSeen = (d: DocumentData): Seen => ({ day: d.day, at: (d.at as Timestamp | null)?.toMillis() ?? Date.now(), name: d.name ?? null });
+
+/** The followers' confirmations for the owner's schedule. */
+export const watchSeen = (pid: string, cb: (seen: Seen[]) => void) => resilient((onError) =>
+  onSnapshot(collection(db, "users", pid, "seen"), (s) => cb(s.docs.map((d) => toSeen(d.data({ serverTimestamps: "estimate" })))), onError));
+
+/** This follower's own confirmation for a followed schedule. */
+export const watchOwnSeen = (pid: string, uid: string, cb: (seen: Seen | null) => void) => resilient((onError) =>
+  onSnapshot(seenRef(pid, uid), (d) => cb(d.exists() ? toSeen(d.data({ serverTimestamps: "estimate" })) : null), onError));
+
+/** `name`: the follower's own schedule name, if they have one (the owner sees "Seen by …"). */
+export const markSeen = (uid: string, pid: string, day: string, name?: string) =>
+  setDoc(seenRef(pid, uid), { day, at: serverTimestamp(), ...(name ? { name: name.slice(0, 30) } : {}) });
+
 /** Opens a value encrypted with `key`; plain values from before encryption pass through, unreadable ones give null. */
 function open<T>(value: unknown, key: Key | null): T | null {
   if (!isEncrypted(value)) return (value as T) ?? null;
@@ -172,21 +197,33 @@ export async function saveSchedule(uid: string, pid: string, input: ScheduleInpu
   const prev = hasSchedule(previous) ? previous : null;
   const tz = deviceTz();
   const today = dayKey(Date.now(), tz);
-  const takenDays = { ...prev?.takenDays };
+  // Another method starts fresh: its days before today count as done, and the old pack starts don't apply.
+  const sameMethod = !!prev && methodOf(prev) === input.method;
+  const takenDays: Record<string, string> = {};
+  for (const [day, v] of Object.entries(prev?.takenDays ?? {})) {
+    // Another method's marks from today on (or done today) would count as this method's actions; older ones are history.
+    if (sameMethod || (day < today && !(v.length > 5 && v.slice(0, 10) >= today))) takenDays[day] = v;
+  }
   if (input.takenTodayAt !== null) takenDays[today] = input.takenTodayAt;
-  else delete takenDays[today];
-  const packStart = addDays(today, -input.todayIndex);
+  else if (input.start !== today) delete takenDays[today];
+  const packStart = input.start ?? addDays(today, -input.todayIndex);
+  // Days before the setup count as done, except after the last injection: an injection due since then is still open.
+  const tracking = (sameMethod && prev?.trackingSince) || today;
+  const trackingSince = input.start && input.start < tracking ? input.start : tracking;
+  // The last injection (given as the cycle start) was done; its time isn't known unless it was recorded before.
+  if (input.start && (!sameMethod || !(input.start in takenDays))) takenDays[input.start] = "";
   const plan: Plan = {
+    method: input.method,
     pillsPerPack: input.pillsPerPack,
     placebo: input.placebo,
     breakDays: input.breakDays,
     packStart,
     // A correction of today's position drops early starts it overrides; earlier ones keep past days in place.
-    earlierPackStarts: (prev?.earlierPackStarts ?? []).filter((a) => a < packStart),
+    earlierPackStarts: sameMethod ? (prev?.earlierPackStarts ?? []).filter((a) => a < packStart) : [],
     supplyPacks: prev?.supplyPacks ?? 0,
     supplyFrom: prev?.supplyFrom ?? packStart,
     appointmentDay: prev?.appointmentDay ?? null,
-    trackingSince: prev?.trackingSince ?? today, // pills before the first setup count as taken
+    trackingSince,
     time: input.time,
     tz,
     repeatMinutes: input.repeatMinutes,
@@ -200,8 +237,10 @@ export async function saveSchedule(uid: string, pid: string, input: ScheduleInpu
     name: input.name.trim(),
     appointmentNote: prev?.appointmentNote ?? "",
     reminderText: input.reminderText.trim(),
-    // The doc is rewritten in full: keep the share-key wrap (it may exist before the first schedule).
+    // The doc is rewritten in full: keep the share-key wrap and the username (both may exist before the first schedule).
     ...(previous?.shareKeyWrap ? { shareKeyWrap: previous.shareKeyWrap } : {}),
+    ...(previous?.username ? { username: previous.username } : {}),
+    ...(previous?.usernameKey ? { usernameKey: previous.usernameKey } : {}),
     // Keep a pending "taken" notification; a fresh "taken today" from the wizard also notifies followers.
     takenPending: (prev?.takenPending ?? false) || (input.takenTodayAt !== null && !(today in (prev?.takenDays ?? {}))),
   };
@@ -232,9 +271,80 @@ export function setTaken(pid: string, s: Schedule, day: string, time: string | n
 }
 
 /**
+ * Records the patch / ring / injection action scheduled for `scheduled` as done (see withAction in shared/schedule.ts),
+ * or undoes it (null), writing only what changed. Done today notifies followers. Pills use setTaken.
+ */
+export function recordAction(pid: string, s: Schedule, scheduled: string, done: { day: string; time: string } | null) {
+  const plan = withAction(s, scheduled, done);
+  const updates: Record<string, unknown> = {};
+  for (const day of new Set([...Object.keys(s.takenDays), ...Object.keys(plan.takenDays)])) {
+    if (s.takenDays[day] !== plan.takenDays[day]) updates[`takenDays.${day}`] = plan.takenDays[day] ?? deleteField();
+  }
+  if (plan.packStart !== s.packStart) Object.assign(updates, { packStart: plan.packStart, earlierPackStarts: plan.earlierPackStarts ?? [] });
+  const doneToday = done !== null && done.day === todayOf(s);
+  return updateDoc(userRef(pid), { ...updates, takenPending: doneToday || (s.takenPending && done !== null), ...notificationTimes(plan) });
+}
+
+/**
  * Subscriber doc + the account's list in one atomic batch, so a subscription can never be half done.
  * Throws if the ID/password combination is wrong (the security rules reject the whole batch).
  */
+// ---------- Usernames ----------
+// The personal ID (pid) stays the internal key: schedule doc, follows, access keys, share keys. On top of it every
+// account has a unique username it can change: usernames/{usernameKey(name)} = { pid, ownerUid, username }, and the
+// profile carries users/{pid}.username for display. Accounts from before usernames claim their personal ID as username.
+
+export const USERNAME_MIN = 2;
+export const USERNAME_MAX = 24;
+// ASCII 33–126 (no spaces), accented Latin (Latin-1, Extended-A/B, Extended Additional), Greek, Cyrillic, Hiragana, Katakana.
+// The same character class is in firestore.rules.
+const USERNAME_RE = /^[!-~\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u024F\u0370-\u03FF\u0400-\u052F\u1E00-\u1EFF\u3040-\u30FF]{2,24}$/u;
+/** As typed, without surrounding spaces, and with composed characters ("o" + "¨" → "ö"). */
+export const cleanUsername = (input: string) => input.trim().normalize("NFC");
+/** 2 to 24 allowed characters; "__…__" and dot-only names are reserved by Firestore. */
+export const validUsername = (name: string) => USERNAME_RE.test(name) && !/^__.*__$/.test(name) && !/^\.+$/.test(name);
+/**
+ * Document ID of a username: case-insensitive, with "%" and "/" (not allowed in IDs) escaped. Lowercased letter by
+ * letter (no context rules like the Greek final sigma), the same way as lower() in firestore.rules.
+ */
+export const usernameKey = (name: string) => [...name].map((c) => { const l = c.toLowerCase(); return [...l].length === 1 ? l : c; }).join("")
+  .replace(/%/g, "%25").replace(/\//g, "%2F");
+const usernameRef = (name: string) => doc(db, "usernames", usernameKey(name));
+
+/** The personal ID behind a username (or a personal ID typed directly, from before usernames), or null. */
+export async function resolveUsername(input: string): Promise<string | null> {
+  const name = cleanUsername(input);
+  if (validUsername(name)) {
+    const snap = await getDoc(usernameRef(name));
+    if (snap.exists()) return snap.data().pid as string;
+  }
+  const legacy = name.toUpperCase();
+  return /^[A-HJKMNP-Z2-9]{6}$/.test(legacy) ? legacy : null;
+}
+
+/** Whether `name` is free (or already this account's). */
+export async function usernameAvailable(name: string, pid: string) {
+  const snap = await getDoc(usernameRef(name));
+  return !snap.exists() || snap.data().pid === pid;
+}
+
+/** Claims `name` for the own profile and frees the previous one, in one batch (the rules reject a taken name). */
+export async function setUsername(uid: string, pid: string, name: string, previous?: string) {
+  const batch = writeBatch(db);
+  if (previous && usernameKey(previous) !== usernameKey(name)) batch.delete(usernameRef(previous));
+  batch.set(usernameRef(name), { pid, ownerUid: uid, username: name });
+  batch.update(userRef(pid), { username: name, usernameKey: usernameKey(name) });
+  await batch.commit();
+}
+
+/** Accounts from before usernames (or just created): claim the personal ID as username, or a variant if it's taken. */
+export async function ensureUsername(uid: string, pid: string, profile: Profile) {
+  if (profile.username) return;
+  for (const name of [pid, `${pid}_${newPersonalId().slice(0, 3)}`, `${pid}_${newPersonalId().slice(0, 3)}`]) {
+    try { return await setUsername(uid, pid, name); } catch { /* taken: try the next one */ }
+  }
+}
+
 export async function subscribe(uid: string, pid: string, password: string) {
   const follow = async (key: string) => {
     const batch = writeBatch(db);
@@ -263,6 +373,7 @@ export async function unlockFollowedNotes(uid: string, pid: string, password: st
 export async function unsubscribe(uid: string, pid: string) {
   const batch = writeBatch(db);
   batch.delete(subscriberRef(pid, uid));
+  batch.delete(seenRef(pid, uid));
   batch.update(accountRef(uid), { subs: arrayRemove(pid) });
   await batch.commit();
   await removeFollowedShareKey(uid, pid);
@@ -277,10 +388,13 @@ export const removeToken = (uid: string, token: string) => updateDoc(accountRef(
 
 /** Deletes everything the account owns in one batch: own schedule with its followers and password, follows, the account. */
 export async function deleteAccountData(uid: string, account: Account) {
-  const followers = await getDocs(collection(db, "users", account.pid, "subscribers"));
+  const [followers, seen] = await Promise.all(["subscribers", "seen"].map((c) => getDocs(collection(db, "users", account.pid, c))));
+  const username = (await getDoc(userRef(account.pid))).data()?.username as string | undefined;
   const batch = writeBatch(db);
+  if (username) batch.delete(usernameRef(username));
   followers.forEach((d) => batch.delete(d.ref));
-  account.subs.forEach((pid) => batch.delete(subscriberRef(pid, uid)));
+  seen.forEach((d) => batch.delete(d.ref));
+  account.subs.forEach((pid) => { batch.delete(subscriberRef(pid, uid)); batch.delete(seenRef(pid, uid)); });
   batch.delete(authRef(account.pid));
   batch.delete(notesRef(account.pid, "shared"));
   batch.delete(notesRef(account.pid, "private"));

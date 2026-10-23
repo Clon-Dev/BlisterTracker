@@ -86,6 +86,8 @@ type Props = {
   /** Whether today's pill is marked (null: no own schedule or a pill-free day); the kitten celebrates the change. */
   takenToday: boolean | null;
   hasNoteToday: boolean | null;
+  /** The user's username if they chose one (not the automatic personal ID): Nyxi uses it now and then. */
+  name: string | null;
   onTakePill: () => void;
   onFocusNote: () => void;
   children: React.ReactNode;
@@ -104,10 +106,24 @@ class WithoutKittenOnError extends React.Component<{ fallback: React.ReactNode; 
   render() { return this.state.failed ? this.props.fallback : this.props.children; }
 }
 
+/**
+ * A line from a pool, addressing the user by `name` about half the time (when there is one). Picked once and rendered
+ * per language, so an open bubble shows the same line after a language switch.
+ */
+function line(plain: (t: Strings) => readonly string[], named: (t: Strings) => readonly ((n: string) => string)[], name: string | null) {
+  const useName = !!name && Math.random() < 0.5;
+  const r = Math.random();
+  return (t: Strings) => {
+    if (useName) { const pool = named(t); return pool[Math.floor(r * pool.length)](name!); }
+    const pool = plain(t);
+    return pool[Math.floor(r * pool.length)];
+  };
+}
+
 const run = (anim: Animated.CompositeAnimation) => new Promise<boolean>((resolve) => anim.start(({ finished }) => resolve(finished)));
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function World({ scroll, day, getPill, takenToday, hasNoteToday, onTakePill, onFocusNote, factsEnabled, children }: Props & { factsEnabled: boolean }) {
+function World({ scroll, day, getPill, takenToday, hasNoteToday, name, onTakePill, onFocusNote, factsEnabled, children }: Props & { factsEnabled: boolean }) {
   const { t, lang } = useI18n();
   const sheetOpen = useSheetOpen();
 
@@ -214,7 +230,7 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, onTakePill, onF
       if (id === except || f.height === 0) return;
       const kittenTop = f.y + baseRoom(f.inset) + f.inset + 2 - KH;
       const cardTop = f.y + Math.max(baseRoom(f.inset), need) + f.inset;
-      if (kittenTop < top + 6 || cardTop > top + scroll.viewport - 60) return;
+      if (kittenTop < top + 6 || (need > 0 && f.y < top + 6) || cardTop > top + scroll.viewport - 60) return;
       const score = Math.abs(kittenTop - (top + scroll.viewport * 0.28));
       if (score < bestScore) { bestScore = score; best = id; }
     });
@@ -226,7 +242,9 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, onTakePill, onF
     const f = frames.get(s.spot);
     if (!f) return false;
     const room = Math.max(roomHeight(s.spot), need);
-    return f.y + room + f.inset + 2 - KH >= scrollNow.current + 4 && f.y + room + f.inset <= scrollNow.current + scroll.viewport - 8;
+    // The room's top (where a tall bubble starts) and the card edge below it must both be on screen.
+    return f.y >= scrollNow.current + 4 && f.y + room + f.inset + 2 - KH >= scrollNow.current + 4
+      && f.y + room + f.inset <= scrollNow.current + scroll.viewport - 8;
   };
 
   /** Steps out of the room onto the layer (same spot on screen), so the room can close. */
@@ -420,6 +438,9 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, onTakePill, onF
   const showFact = () => {
     const index = pickFact(TOPICS, memoryFor(day));
     const fact = FACTS[index];
+    // To find the fact behind a bubble (e.g. to fix a translation): browser console, or `nyxiFact` there.
+    console.info(`[Nyxi] fact FACTS[${index}] tag "${fact.tag}" (src/mascot/facts.ts)`);
+    (globalThis as { nyxiFact?: unknown }).nyxiFact = { index, ...fact };
     updateMemory(day, (mem) => rememberFact(mem, index, fact.topic, FACTS.length));
     say("fact", (t, lang) => ({
       title: t.mascotFactTitle, text: fact[lang], source: { name: fact.source, url: fact.url, label: t.mascotSource },
@@ -463,16 +484,27 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, onTakePill, onF
       }
       if (due.kind === "reminder") {
         updateMemory(day, (mem) => ({ ...mem, greeted: true }));
+        const action = due.action as keyof Strings["mascotActionReminder"] | undefined;
         say("reminder", (t) => ({
-          text: due.late ? t.mascotReminderLate({ n: due.number }) : t.mascotReminder({ n: due.number }),
+          text: action ? t.mascotActionReminder[action] : due.late ? t.mascotReminderLate({ n: due.number }) : t.mascotReminder({ n: due.number }),
           buttons: [
-            { label: t.mascotTaken, primary: true, onPress: () => { quiet(); onTakePill(); } },
+            { label: action ? t.mascotDone : t.mascotTaken, primary: true, onPress: () => { quiet(); onTakePill(); } },
             { label: t.mascotLater, onPress: () => { updateMemory(day, (mem) => ({ ...mem, snoozeUntil: Date.now() + SNOOZE })); quiet(); } },
           ],
         }));
       } else if (due.kind === "greet") {
-        updateMemory(day, (mem) => ({ ...mem, greeted: true, introduced: true }));
-        say("greet", (t) => ({ text: due.intro ? t.mascotIntro : t.mascotGreet[due.part] }), due.intro ? 4500 : 3200);
+        updateMemory(day, (mem) => ({ ...mem, greeted: true, introduced: true, saidGoodnight: mem.saidGoodnight || (due.part === "night" && !due.intro) }));
+        const text = line((t) => t.mascotGreet[due.part], (t) => t.mascotGreetNamed[due.part], name);
+        say("greet", (t) => ({ text: due.intro ? t.mascotIntro : text(t) }), due.intro ? 4500 : 3200);
+      } else if (due.kind === "soon") {
+        updateMemory(day, (mem) => ({ ...mem, soonSaid: true }));
+        say("soon", (t) => ({ text: t.mascotSoon({ days: due.days }) }), 5000);
+      } else if (due.kind === "goodnight") {
+        updateMemory(day, (mem) => ({ ...mem, saidGoodnight: true }));
+        const text = line((t) => t.mascotGreet.night, (t) => t.mascotGreetNamed.night, name);
+        say("goodnight", (t) => ({ text: text(t) }), 3800);
+        setExpression("sleepy");
+        setTimeout(() => setExpression("normal"), 3800);
       } else if (due.kind === "mood") {
         updateMemory(day, (mem) => ({ ...mem, moodAsked: true }));
         say("mood", (t) => ({ text: t.mascotMood, buttons: [{ label: t.mascotMoodYes, primary: true, onPress: openNotes }, { label: t.mascotMoodNo, onPress: quiet }] }));
@@ -498,8 +530,8 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, onTakePill, onF
       Animated.timing(squash, { toValue: 0.85, duration: 120, useNativeDriver: nativeDriver }),
       Animated.spring(squash, { toValue: 1, useNativeDriver: nativeDriver, speed: 12, bounciness: 14 }),
     ]).start();
-    const yay = Math.floor(Math.random() * t.mascotYay.length);
-    say("yay", (t) => ({ text: t.mascotYay[yay] }), 2800);
+    const yay = line((t) => t.mascotYay, (t) => t.mascotYayNamed, name);
+    say("yay", (t) => ({ text: yay(t) }), 2800);
     const id = setTimeout(() => setExpression("normal"), 2800);
     return () => clearTimeout(id);
   }, [takenToday]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -561,15 +593,15 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, onTakePill, onF
     setTimeout(() => setExpression("normal"), 1300);
     if (messageRef.current && messageRef.current.kind !== "purr") return; // a purr doesn't keep the next tap from counting
     if (tapsSinceDecline.current !== null) tapsSinceDecline.current++;
-    const purr = Math.floor(Math.random() * t.mascotPurr.length);
+    const purr = line((t) => t.mascotPurr, (t) => t.mascotPurrNamed, name);
     if (factsEnabled && offersFact(tapsSinceDecline.current)) {
       tapsSinceDecline.current = null;
       say("offer", (t) => ({
-        text: `${t.mascotPurr[purr]} ${t.mascotOfferFact}`,
+        text: `${purr(t)} ${t.mascotOfferFact}`,
         buttons: [{ label: t.mascotYes, primary: true, onPress: showFact }, { label: t.mascotNo, onPress: declined }],
       }));
     } else {
-      say("purr", (t) => ({ text: t.mascotPurr[purr] }), 1800);
+      say("purr", (t) => ({ text: purr(t) }), 1800);
     }
   };
   const askHide = () => {

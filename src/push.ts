@@ -26,21 +26,32 @@ export async function enablePush(): Promise<string | null> {
   return String(token.data);
 }
 
-/** The "Taken" button on the owner's reminder (category "reminder" in the worker's messages). */
-export async function registerTakenAction(buttonTitle: string) {
-  await Notifications.setNotificationCategoryAsync("reminder", [
-    { identifier: "taken", buttonTitle, options: { opensAppToForeground: true } },
+export type NotificationAction = "taken" | "seen";
+export type ActionTitles = { taken: string; done: string; seen: string };
+
+/**
+ * The notification buttons (categories in the worker's messages): "Taken" on the owner's pill reminder (category "reminder"),
+ * "Done" on a patch / ring / injection reminder (category "action", same "taken" action) and "Mark as seen" on the
+ * followers' "pill taken" notice (category "seen").
+ */
+export async function registerActions(titles: ActionTitles) {
+  await Promise.all([
+    Notifications.setNotificationCategoryAsync("reminder", [{ identifier: "taken", buttonTitle: titles.taken, options: { opensAppToForeground: true } }]),
+    Notifications.setNotificationCategoryAsync("action", [{ identifier: "taken", buttonTitle: titles.done, options: { opensAppToForeground: true } }]),
+    Notifications.setNotificationCategoryAsync("seen", [{ identifier: "seen", buttonTitle: titles.seen, options: { opensAppToForeground: true } }]),
   ]);
 }
 
-/** Calls `cb(pid, day)` when the "Taken" button was pressed, including when it launched the app. */
-export function onTakenAction(cb: (pid: string, day: string) => void) {
+/** Calls `cb(action, pid, day)` when a notification button was pressed, including when it launched the app. */
+export function onNotificationAction(cb: (action: NotificationAction, pid: string, day: string) => void) {
   const handle = (response: Notifications.NotificationResponse | null) => {
-    if (response?.actionIdentifier !== "taken") return;
+    if (!response) return;
+    const action = response.actionIdentifier;
+    if (action !== "taken" && action !== "seen") return;
     Notifications.clearLastNotificationResponse(); // don't re-apply it on the next launch
     Notifications.dismissNotificationAsync(response.notification.request.identifier);
     const { pid, day } = response.notification.request.content.data as { pid: string; day: string };
-    cb(pid, day);
+    cb(action, pid, day);
   };
   handle(Notifications.getLastNotificationResponse());
   const sub = Notifications.addNotificationResponseReceivedListener(handle);

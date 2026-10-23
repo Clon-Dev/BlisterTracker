@@ -5,11 +5,19 @@ export const OFFER_EVERY = 3;
 const GREET_WINDOW = 60_000; // greet only right after opening
 const MOOD_DELAY = 6_000;
 const FACT_DELAY = 20_000;
+/** From this hour Nyxi says good night (once per evening). */
+export const NIGHT_HOUR = 21;
+const NIGHT_DELAY = 10_000; // after the mood question's turn, so good night comes last
 export const NAP_AFTER = 120_000;
 export const SNOOZE = 30 * 60_000;
 
-/** Today's pill of the own schedule. `minutesLate` counts from the reminder time. */
-export type PillState = { number: number; state: "due" | "overdue" | "taken" | "break"; minutesLate: number } | null;
+/**
+ * Today's pill (or patch / ring / injection action) of the own schedule. `minutesLate` counts from the reminder time;
+ * `action` names a non-pill action; `soonDays`: an injection due in that many days.
+ */
+export type PillState = {
+  number: number; state: "due" | "overdue" | "taken" | "break"; minutesLate: number; action?: string; soonDays?: number;
+} | null;
 
 /** Remembered per device (AsyncStorage). The daily fields reset when the day changes. */
 export type Memory = {
@@ -18,6 +26,10 @@ export type Memory = {
   autoFact: boolean;
   moodAsked: boolean;
   greeted: boolean;
+  /** Said good night this evening. */
+  saidGoodnight?: boolean;
+  /** Mentioned today that the injection is due soon. */
+  soonSaid?: boolean;
   hidden: boolean;
   snoozeUntil: number;
   /** Facts already shown; cleared once all were shown. */
@@ -47,18 +59,28 @@ export type Situation = {
 };
 
 export type Say =
-  | { kind: "reminder"; number: number; late: boolean }
-  | { kind: "greet"; part: "morning" | "day" | "evening"; intro: boolean }
+  | { kind: "reminder"; number: number; late: boolean; action?: string }
+  | { kind: "soon"; days: number }
+  | { kind: "greet"; part: "morning" | "day" | "evening" | "night"; intro: boolean }
+  | { kind: "goodnight" }
   | { kind: "mood" }
   | { kind: "fact" };
 
-/** The message that is due now, by priority: reminder, greeting, mood question, fact. */
+/** The message that is due now, by priority: reminder, greeting, mood question, good night, fact. */
 export function nextMessage(s: Situation, m: Memory): Say | null {
   if (m.hidden) return null;
-  if (s.pill?.state === "overdue" && s.now >= m.snoozeUntil) return { kind: "reminder", number: s.pill.number, late: s.pill.minutesLate >= 60 };
-  if (!m.greeted && s.openedFor < GREET_WINDOW) return { kind: "greet", part: s.hour < 11 ? "morning" : s.hour < 18 ? "day" : "evening", intro: !m.introduced };
+  if (s.pill?.state === "overdue" && s.now >= m.snoozeUntil) {
+    return { kind: "reminder", number: s.pill.number, late: s.pill.minutesLate >= 60, ...(s.pill.action ? { action: s.pill.action } : {}) };
+  }
+  // An injection due within a week: once a day, so there's time to book the appointment.
+  if (s.pill?.soonDays !== undefined && s.pill.soonDays <= 7 && !m.soonSaid && s.openedFor >= 4_000) return { kind: "soon", days: s.pill.soonDays };
+  if (!m.greeted && s.openedFor < GREET_WINDOW) {
+    const part = s.hour < 11 ? "morning" : s.hour < 18 ? "day" : s.hour < NIGHT_HOUR ? "evening" : "night";
+    return { kind: "greet", part, intro: !m.introduced };
+  }
   const settled = s.pill?.state === "taken" || s.pill?.state === "break" || s.hour >= 18;
   if (s.hasNoteToday === false && !m.moodAsked && settled && s.openedFor >= MOOD_DELAY) return { kind: "mood" };
+  if (s.hour >= NIGHT_HOUR && !m.saidGoodnight && s.openedFor >= NIGHT_DELAY) return { kind: "goodnight" };
   if (s.factsEnabled && !m.autoFact && s.openedFor >= FACT_DELAY) return { kind: "fact" };
   return null;
 }

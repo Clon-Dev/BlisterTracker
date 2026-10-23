@@ -2,15 +2,17 @@
 // Every minute it
 //   1. sends due reminders (users/{pid}.nextReminderAt <= now): the owner gets the reminder and its
 //      repeats (with a "Taken" button), followers the first one,
-//   2. tells followers when a pill is still not taken (nextLateAt <= now),
-//   3. tells followers when today's pill was marked taken (takenPending == true),
-//   4. sends the owner's refill and appointment notices (nextNoticeAt <= now).
+//   2. tells followers when a pill (patch change, ring, injection) is still not done (nextLateAt <= now),
+//   3. tells followers when today's pill (or action) was marked done (takenPending == true),
+//   4. sends the owner's refill, appointment and upcoming-injection notices (nextNoticeAt <= now).
+// Patch, ring and injection actions stay open until done, so their reminders come back daily.
 // The app computes nextReminderAt/nextLateAt on every change with the same shared/schedule.ts;
 // the worker advances them after each send. Pushes go out as data-only FCM messages, which the
 // Android app (expo-notifications) and the web service worker turn into notifications.
 
 import {
-  addDays, dayKey, lateTime, nextLateAt, nextNoticeAt, nextReminderAt, noticesAt, reminderTimes, type Plan,
+  actionKey, actionOn, addDays, dayKey, diffDays, doneOn, lateTime, METHODS, methodOf, nextLateAt, nextNoticeAt, nextReminderAt, noticesAt,
+  openActionDay, reminderTimes, type ActionKey, type Method, type Plan,
 } from "../../shared/schedule";
 
 export interface Env {
@@ -136,7 +138,9 @@ const ts = (ms: number | null): Value => (ms === null ? { nullValue: null } : { 
 
 function planOf(d: Doc): Plan {
   const taken = d.fields?.takenDays?.mapValue?.fields ?? {};
+  const method = str(d, "method") as Method;
   return {
+    ...(METHODS.includes(method) ? { method } : {}),
     pillsPerPack: int(d, "pillsPerPack"), placebo: int(d, "placebo"), breakDays: int(d, "breakDays"),
     packStart: str(d, "packStart"), trackingSince: str(d, "trackingSince"), time: str(d, "time"), tz: str(d, "tz"),
     repeatMinutes: int(d, "repeatMinutes"), lateMinutes: int(d, "lateMinutes"),
@@ -151,32 +155,126 @@ function planOf(d: Doc): Plan {
 
 type Lang = "en" | "de";
 type Text = { title: string; body: string };
+type Key = ActionKey;
+const EMOJI: Record<Key, string> = { pill: "💊", apply: "🩹", change: "🩹", removePatch: "🩹", insert: "⭕", removeRing: "⭕", inject: "💉" };
+/** `at` is " at 09:12" / " um 09:12", or empty when the time isn't known. */
 const TEXT = {
   en: {
-    ownerReminder: (): Text => ({ title: "💊 Pill time", body: "Time to take today’s pill." }),
-    ownerRepeat: (): Text => ({ title: "💊 Still not taken", body: "Don’t forget today’s pill." }),
-    subscriberReminder: (name: string): Text => ({ title: "💊 Pill time", body: `${name} should take today’s pill now.` }),
-    late: (name: string): Text => ({ title: "⏰ Not taken yet", body: `${name} hasn’t marked today’s pill as taken yet.` }),
-    taken: (name: string, time: string): Text => ({ title: "✅ Pill taken", body: `${name} took today’s pill at ${time}.` }),
-    refill: (): Text => ({ title: "📦 Last pack started", body: "Time to get a refill of your pill." }),
+    ownerReminder: (k: Key, daysLate: number): Text => (daysLate > 0
+      ? { title: `${EMOJI[k]} ${EN_SHORT[k]} overdue`, body: `${daysLate === 1 ? "1 day" : `${daysLate} days`} late – open the app to see what applies now.` }
+      : {
+        pill: { title: "💊 Pill time", body: "Time to take today’s pill." },
+        apply: { title: "🩹 New patch today", body: "Time to put on a new patch." },
+        change: { title: "🩹 Patch change today", body: "Time to change your patch." },
+        removePatch: { title: "🩹 Patch off today", body: "Time to take off your patch – the patch-free week starts." },
+        insert: { title: "⭕ New ring today", body: "Time to insert a new ring." },
+        removeRing: { title: "⭕ Ring out today", body: "Time to take out your ring – the ring-free week starts." },
+        inject: { title: "💉 Injection due", body: "Your injection is due today." },
+      }[k]),
+    ownerRepeat: (k: Key): Text => (k === "pill"
+      ? { title: "💊 Still not taken", body: "Don’t forget today’s pill." }
+      : { title: `${EMOJI[k]} Still open`, body: `Don’t forget: ${EN_WHAT[k]}.` }),
+    subscriberReminder: (name: string, k: Key): Text => ({ title: `${EMOJI[k]} ${k === "pill" ? "Pill time" : `${EN_SHORT[k]} today`}`, body: {
+      pill: `${name} should take today’s pill now.`,
+      apply: `${name} should put on a new patch today.`,
+      change: `${name} should change the patch today.`,
+      removePatch: `${name} should take off the patch today.`,
+      insert: `${name} should insert a new ring today.`,
+      removeRing: `${name} should take out the ring today.`,
+      inject: `${name}’s injection is due today.`,
+    }[k] }),
+    late: (name: string, k: Key): Text => (k === "pill"
+      ? { title: "⏰ Not taken yet", body: `${name} hasn’t marked today’s pill as taken yet.` }
+      : { title: "⏰ Not done yet", body: `${name} hasn’t marked ${EN_WHAT[k]} as done yet (${k === "inject" ? "a week" : "a day"} late).` }),
+    taken: (name: string, k: Key, at: string): Text => ({
+      title: { pill: "✅ Pill taken", apply: "✅ New patch on", change: "✅ Patch changed", removePatch: "✅ Patch off", insert: "✅ New ring in", removeRing: "✅ Ring out", inject: "✅ Injection done" }[k],
+      body: {
+        pill: `${name} took today’s pill${at}.`,
+        apply: `${name} put on a new patch${at}.`,
+        change: `${name} changed the patch${at}.`,
+        removePatch: `${name} took off the patch${at}.`,
+        insert: `${name} inserted a new ring${at}.`,
+        removeRing: `${name} took out the ring${at}.`,
+        inject: `${name} got the injection${at}.`,
+      }[k],
+    }),
+    at: (time: string) => (time ? ` at ${time}` : ""),
+    refill: (m: Method): Text => (m === "patch" ? { title: "📦 Last patches started", body: "Time to get more patches." }
+      : m === "ring" ? { title: "📦 Last ring in use", body: "Time to get new rings." }
+        : { title: "📦 Last pack started", body: "Time to get a refill of your pill." }),
     appointment: (): Text => ({ title: "🩺 Doctor’s appointment tomorrow", body: "Don’t forget your appointment tomorrow." }),
+    injection: (): Text => ({ title: "💉 Injection in 7 days", body: "Time to book your appointment." }),
     takenButton: "Taken ✓",
+    doneButton: "Done ✓",
+    seenButton: "Mark as seen",
   },
   de: {
-    ownerReminder: (): Text => ({ title: "💊 Pillenzeit", body: "Zeit für die heutige Pille." }),
-    ownerRepeat: (): Text => ({ title: "💊 Noch nicht genommen", body: "Vergiss die heutige Pille nicht." }),
-    subscriberReminder: (name: string): Text => ({ title: "💊 Pillenzeit", body: `${name} sollte jetzt die heutige Pille nehmen.` }),
-    late: (name: string): Text => ({ title: "⏰ Noch nicht genommen", body: `${name} hat die heutige Pille noch nicht als genommen markiert.` }),
-    taken: (name: string, time: string): Text => ({ title: "✅ Pille genommen", body: `${name} hat die heutige Pille um ${time} genommen.` }),
-    refill: (): Text => ({ title: "📦 Letzter Blister angebrochen", body: "Zeit, die Pille nachzukaufen." }),
+    ownerReminder: (k: Key, daysLate: number): Text => (daysLate > 0
+      ? { title: `${EMOJI[k]} ${DE_SHORT[k]} überfällig`, body: `${daysLate === 1 ? "1 Tag" : `${daysLate} Tage`} zu spät – in der App siehst du, was jetzt gilt.` }
+      : {
+        pill: { title: "💊 Pillenzeit", body: "Zeit für die heutige Pille." },
+        apply: { title: "🩹 Heute neues Pflaster", body: "Zeit, ein neues Pflaster aufzukleben." },
+        change: { title: "🩹 Heute Pflasterwechsel", body: "Zeit, dein Pflaster zu wechseln." },
+        removePatch: { title: "🩹 Heute Pflaster ab", body: "Zeit, das Pflaster abzunehmen – die pflasterfreie Woche beginnt." },
+        insert: { title: "⭕ Heute neuer Ring", body: "Zeit, einen neuen Ring einzusetzen." },
+        removeRing: { title: "⭕ Heute Ring raus", body: "Zeit, den Ring herauszunehmen – die ringfreie Woche beginnt." },
+        inject: { title: "💉 Spritze fällig", body: "Deine Spritze ist heute fällig." },
+      }[k]),
+    ownerRepeat: (k: Key): Text => (k === "pill"
+      ? { title: "💊 Noch nicht genommen", body: "Vergiss die heutige Pille nicht." }
+      : { title: `${EMOJI[k]} Noch offen`, body: `Nicht vergessen: ${DE_SHORT[k]}.` }),
+    subscriberReminder: (name: string, k: Key): Text => ({ title: `${EMOJI[k]} ${k === "pill" ? "Pillenzeit" : `Heute: ${DE_SHORT[k]}`}`, body: {
+      pill: `${name} sollte jetzt die heutige Pille nehmen.`,
+      apply: `${name} sollte heute ein neues Pflaster aufkleben.`,
+      change: `${name} sollte heute das Pflaster wechseln.`,
+      removePatch: `${name} sollte heute das Pflaster abnehmen.`,
+      insert: `${name} sollte heute einen neuen Ring einsetzen.`,
+      removeRing: `${name} sollte heute den Ring herausnehmen.`,
+      inject: `Die Spritze von ${name} ist heute fällig.`,
+    }[k] }),
+    late: (name: string, k: Key): Text => (k === "pill"
+      ? { title: "⏰ Noch nicht genommen", body: `${name} hat die heutige Pille noch nicht als genommen markiert.` }
+      : { title: "⏰ Noch nicht erledigt", body: `${name} hat ${DE_WHAT[k]} noch nicht als erledigt markiert (${k === "inject" ? "eine Woche" : "einen Tag"} zu spät).` }),
+    taken: (name: string, k: Key, at: string): Text => ({
+      title: { pill: "✅ Pille genommen", apply: "✅ Neues Pflaster drauf", change: "✅ Pflaster gewechselt", removePatch: "✅ Pflaster ab", insert: "✅ Neuer Ring drin", removeRing: "✅ Ring raus", inject: "✅ Spritze erledigt" }[k],
+      body: {
+        pill: `${name} hat die heutige Pille${at} genommen.`,
+        apply: `${name} hat${at} ein neues Pflaster aufgeklebt.`,
+        change: `${name} hat das Pflaster${at} gewechselt.`,
+        removePatch: `${name} hat das Pflaster${at} abgenommen.`,
+        insert: `${name} hat${at} einen neuen Ring eingesetzt.`,
+        removeRing: `${name} hat den Ring${at} herausgenommen.`,
+        inject: `${name} hat${at} die Spritze bekommen.`,
+      }[k],
+    }),
+    at: (time: string) => (time ? ` um ${time}` : ""),
+    refill: (m: Method): Text => (m === "patch" ? { title: "📦 Letzte Pflaster angebrochen", body: "Zeit, Pflaster nachzukaufen." }
+      : m === "ring" ? { title: "📦 Letzter Ring in Gebrauch", body: "Zeit, neue Ringe zu besorgen." }
+        : { title: "📦 Letzter Blister angebrochen", body: "Zeit, die Pille nachzukaufen." }),
     appointment: (): Text => ({ title: "🩺 Arzttermin morgen", body: "Denk an deinen Termin morgen." }),
+    injection: (): Text => ({ title: "💉 Spritze in 7 Tagen", body: "Zeit, einen Termin zu vereinbaren." }),
     takenButton: "Genommen ✓",
+    doneButton: "Erledigt ✓",
+    seenButton: "Als gesehen markieren",
   },
 } satisfies Record<Lang, unknown>;
+const EN_SHORT: Record<Key, string> = { pill: "Pill", apply: "New patch", change: "Patch change", removePatch: "Patch off", insert: "New ring", removeRing: "Ring out", inject: "Injection" };
+const EN_WHAT: Record<Key, string> = {
+  pill: "today’s pill", apply: "the new patch", change: "the patch change", removePatch: "the patch removal", insert: "the new ring", removeRing: "the ring removal", inject: "the injection",
+};
+const DE_SHORT: Record<Key, string> = { pill: "Pille", apply: "Neues Pflaster", change: "Pflasterwechsel", removePatch: "Pflaster ab", insert: "Neuer Ring", removeRing: "Ring raus", inject: "Spritze" };
+const DE_WHAT: Record<Key, string> = {
+  pill: "die heutige Pille", apply: "das neue Pflaster", change: "den Pflasterwechsel", removePatch: "das Abnehmen des Pflasters", insert: "den neuen Ring", removeRing: "das Herausnehmen des Rings", inject: "die Spritze",
+};
+/** What's due on `day` (pill days: "pill"). */
+const keyOn = (p: Plan, day: string): Key => actionKey(p, actionOn(p, day) ?? "pill");
 type Texts = (typeof TEXT)["en"];
 
-/** With `takenAction`, the notification gets a "Taken" button that marks the pill of `day`. */
-type Push = { text: (t: Texts) => Text; tag: string; takenAction?: { pid: string; day: string } };
+/**
+ * With `action`, the notification gets a button for the pill of `day`: "taken" (the owner's reminder) marks it,
+ * "seen" (the followers' "taken" notice) confirms the follower has seen it.
+ */
+type Push = { text: (t: Texts) => Text; tag: string; action?: { kind: "taken" | "seen"; pid: string; day: string; method?: Method } };
 
 /** Sends to every device of the given accounts, each in its account's language. Returns the number delivered. */
 async function sendAll(env: Env, fs: Firestore, uids: string[], push: Push) {
@@ -185,8 +283,13 @@ async function sendAll(env: Env, fs: Firestore, uids: string[], push: Push) {
   await Promise.all(targets.map(async ({ uid, token, lang }) => {
     const { title, body } = push.text(TEXT[lang]);
     // Data-only: expo-notifications (Android) and the web service worker build the notification from these keys.
-    const data: Record<string, string> = { title, message: body, tag: push.tag, channelId: "default", body: JSON.stringify(push.takenAction ?? {}) };
-    if (push.takenAction) Object.assign(data, { categoryId: "reminder", actionTitle: TEXT[lang].takenButton });
+    const { action } = push;
+    const data: Record<string, string> = { title, message: body, tag: push.tag, channelId: "default", body: JSON.stringify(action ? { pid: action.pid, day: action.day } : {}) };
+    if (action?.kind === "taken") {
+      const pill = (action.method ?? "pill") === "pill";
+      Object.assign(data, { categoryId: pill ? "reminder" : "action", actionTitle: pill ? TEXT[lang].takenButton : TEXT[lang].doneButton });
+    }
+    if (action?.kind === "seen") Object.assign(data, { categoryId: "seen", actionTitle: TEXT[lang].seenButton });
     const res = await fetch(`https://fcm.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/messages:send`, {
       method: "POST",
       headers: { Authorization: `Bearer ${fs.token}`, "Content-Type": "application/json" },
@@ -225,16 +328,21 @@ async function sendReminders(env: Env, fs: Firestore, now: number) {
     const index = reminderTimes(plan, day).indexOf(dueAt);
     if (index < 0 || now - dueAt > MAX_LATE_MS) return;
 
-    const name = str(doc, "name") || pid;
+    const name = str(doc, "name") || str(doc, "username") || pid;
+    // Patch / ring / injection: the open action may be carried over from an earlier day.
+    const method = methodOf(plan);
+    const open = method === "pill" ? day : openActionDay(plan, day) ?? day;
+    const key = keyOn(plan, open);
+    const daysLate = diffDays(open, day);
     // The owner may replace the reminder wording (e.g. something discreet); it then becomes the title.
     const custom = str(doc, "reminderText");
     const owner = sendAll(env, fs, [str(doc, "ownerUid")], {
-      text: (t) => (custom ? { title: custom, body: "" } : index === 0 ? t.ownerReminder() : t.ownerRepeat()),
-      tag: `reminder-${pid}`, takenAction: { pid, day },
+      text: (t) => (custom ? { title: custom, body: "" } : index === 0 ? t.ownerReminder(key, daysLate) : t.ownerRepeat(key)),
+      tag: `reminder-${pid}`, action: { kind: "taken", pid, day, method },
     });
-    // Followers only get the first reminder; repeats are for the owner.
-    const followers = index === 0
-      ? sendAll(env, fs, await fs.subscriberUids(pid), { text: (t) => t.subscriberReminder(name), tag: `reminder-${pid}` })
+    // Followers only get the first reminder, and only on the day it's scheduled (late alerts cover the days after).
+    const followers = index === 0 && daysLate === 0
+      ? sendAll(env, fs, await fs.subscriberUids(pid), { text: (t) => t.subscriberReminder(name, key), tag: `reminder-${pid}` })
       : 0;
     console.log(`reminder ${pid} #${index}: ${(await owner) + (await followers)} notifications`);
   });
@@ -250,8 +358,10 @@ async function sendLateAlerts(env: Env, fs: Firestore, now: number) {
     const today = dayKey(dueAt, plan.tz);
     const still = [today, addDays(today, -1)].some((d) => lateTime(plan, d) === dueAt);
     if (!still || now - dueAt > MAX_LATE_MS) return;
-    const name = str(doc, "name") || pid;
-    const sent = await sendAll(env, fs, await fs.subscriberUids(pid), { text: (t) => t.late(name), tag: `late-${pid}` });
+    const name = str(doc, "name") || str(doc, "username") || pid;
+    const open = methodOf(plan) === "pill" ? null : openActionDay(plan, today);
+    const key = open ? keyOn(plan, open) : "pill";
+    const sent = await sendAll(env, fs, await fs.subscriberUids(pid), { text: (t) => t.late(name, key), tag: `late-${pid}` });
     console.log(`late ${pid}: ${sent} notifications`);
   });
 }
@@ -261,10 +371,15 @@ async function sendTakenUpdates(env: Env, fs: Firestore, now: number) {
   await forEachDoc("taken", pending, async (doc, pid) => {
     if (!(await fs.patchIfUnchanged(doc, { takenPending: { booleanValue: false } }))) return;
     const plan = planOf(doc);
-    const time = plan.takenDays[dayKey(now, plan.tz)];
-    if (!time) return; // unmarked again before we got to it
-    const name = str(doc, "name") || pid;
-    const sent = await sendAll(env, fs, await fs.subscriberUids(pid), { text: (t) => t.taken(name, time), tag: `taken-${pid}` });
+    const day = dayKey(now, plan.tz);
+    // Pill: today's pill. Patch / ring / injection: the action done today, whatever day it was scheduled for.
+    const done = methodOf(plan) === "pill" ? (plan.takenDays[day] ? { scheduled: day, time: plan.takenDays[day] } : null) : doneOn(plan, day);
+    if (!done) return; // unmarked again before we got to it
+    const key = keyOn(plan, done.scheduled);
+    const name = str(doc, "name") || str(doc, "username") || pid;
+    const sent = await sendAll(env, fs, await fs.subscriberUids(pid), {
+      text: (t) => t.taken(name, key, t.at(done.time)), tag: `taken-${pid}`, action: { kind: "seen", pid, day },
+    });
     console.log(`taken ${pid}: ${sent} notifications`);
   });
 }
@@ -279,7 +394,7 @@ async function sendNotices(env: Env, fs: Firestore, now: number) {
     // The appointment note is end-to-end encrypted, so the push stays generic.
     for (const kind of noticesAt(plan, dueAt)) {
       const sent = await sendAll(env, fs, [str(doc, "ownerUid")], {
-        text: (t) => (kind === "refill" ? t.refill() : t.appointment()), tag: `${kind}-${pid}`,
+        text: (t) => (kind === "refill" ? t.refill(methodOf(plan)) : kind === "injection" ? t.injection() : t.appointment()), tag: `${kind}-${pid}`,
       });
       console.log(`${kind} ${pid}: ${sent} notifications`);
     }

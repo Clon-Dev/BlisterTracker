@@ -1,7 +1,8 @@
 // Unit tests for shared/schedule.ts. Usage: node scripts/test-schedule.ts
 import {
-  addDays, appointmentTime, diffDays, firstEditableDay, isTaken, lateTime, nextLateAt, nextNoticeAt, nextPackStart, nextReminderAt, noticesAt,
-  packsLeft, refillTime, reminderTimes, slot, trackFromPackStart, weekday, zonedTime, type Plan,
+  actionKey, actionOn, addDays, appointmentTime, withAction, diffDays, doneAt, doneOn, firstEditableDay, isTaken, lateness, lateTime, movedTo, nextAction, nextLateAt,
+  nextNoticeAt, nextPackStart, nextReminderAt, noticesAt, openActionDay, packsLeft, refillTime, reminderTimes, slot, trackFromPackStart, weekday,
+  zonedTime, type Plan,
 } from "../shared/schedule.ts";
 
 let failures = 0;
@@ -96,6 +97,91 @@ eq("nothing to materialize when tracking began on a pack start", trackFromPackSt
 const unmarked: Plan = { ...tracked, takenDays: Object.fromEntries(Object.entries(tracked.takenDays).filter(([d]) => d !== "2026-10-03")) };
 eq("an unmarked pre-setup pill now counts as missed", isTaken(unmarked, "2026-10-03"), false);
 eq("break days before tracking stay unmarked", Object.keys(trackFromPackStart({ ...base, trackingSince: "2026-10-24", packStart: "2026-10-01" }).takenDays).includes("2026-10-22"), false);
+
+// ---------- Other methods ----------
+const days = (p: Plan, from: string, n: number) => Array.from({ length: n }, (_, i) => addDays(from, i)).map((d) => actionOn(p, d) && `${d}:${actionOn(p, d)}`).filter(Boolean);
+const patch: Plan = { ...base, method: "patch", packStart: "2026-10-05", trackingSince: "2026-10-05", time: "09:00" };
+eq("pill: a pill every wear day", actionOn(base, "2026-10-02"), "pill");
+eq("patch 21+7: apply, change, change, remove, then apply again", days(patch, "2026-10-05", 29),
+  ["2026-10-05:apply", "2026-10-12:change", "2026-10-19:change", "2026-10-26:remove", "2026-11-02:apply"]);
+eq("patch 42+7: 6 patches in a row, then removed", days({ ...patch, pillsPerPack: 42 }, "2026-10-05", 43).length, 7);
+eq("patch 42+7: removal after the 6th patch", actionOn({ ...patch, pillsPerPack: 42 }, "2026-11-16"), "remove");
+const ring: Plan = { ...patch, method: "ring" };
+eq("ring 21+7: insert, remove, insert", days(ring, "2026-10-05", 29), ["2026-10-05:insert", "2026-10-26:remove", "2026-11-02:insert"]);
+eq("ring 21+0: straight to the next ring", days({ ...ring, breakDays: 0 }, "2026-10-05", 43), ["2026-10-05:insert", "2026-10-26:insert", "2026-11-16:insert"]);
+const shot: Plan = { ...patch, method: "injection", pillsPerPack: 84, breakDays: 0 };
+eq("injection: one every 12 weeks", days(shot, "2026-10-05", 90), ["2026-10-05:inject", "2026-12-28:inject"]);
+eq("injection reminder across the DST change (09:00 CET)", iso(reminderTimes({ ...shot, takenDays: { "2026-10-05": "09:00" } }, "2026-12-28")[0]), "2026-12-28T08:00:00.000Z");
+
+// Open (carried-over) actions
+eq("no reminder on a plain wear day (changes done)", reminderTimes({ ...patch, takenDays: { "2026-10-05": "09:00", "2026-10-12": "09:05" } }, "2026-10-14"), []);
+eq("an undone patch change stays open the next days", [openActionDay(patch, "2026-10-13"), openActionDay(patch, "2026-10-18")], ["2026-10-12", "2026-10-12"]);
+eq("…and keeps reminding", iso(reminderTimes(patch, "2026-10-13")[0]), "2026-10-13T07:00:00.000Z");
+eq("the next scheduled action takes over", openActionDay(patch, "2026-10-19"), "2026-10-19");
+eq("a pill doesn't carry over", openActionDay({ ...base, trackingSince: "2026-10-01" }, "2026-10-03"), "2026-10-03");
+const changedLate: Plan = { ...patch, takenDays: { "2026-10-05": "09:00", "2026-10-12": "2026-10-13T08:15" } };
+eq("a late change is recorded on its scheduled day", [isTaken(changedLate, "2026-10-12"), openActionDay(changedLate, "2026-10-13")], [true, null]);
+eq("…with the day it was done", doneAt(changedLate, "2026-10-12"), { day: "2026-10-13", time: "08:15" });
+eq("…and found by that day", doneOn(changedLate, "2026-10-13"), { scheduled: "2026-10-12", time: "08:15" });
+eq("a late mid-cycle change keeps the change weekday", actionOn(changedLate, "2026-10-19"), "change");
+eq("next action after the 12th", nextAction(changedLate, "2026-10-13"), { day: "2026-10-19", action: "change" });
+
+// Lateness rules
+const due = Date.parse("2026-10-12T07:00:00Z"); // 09:00 Berlin
+eq("patch change 47 h late: still protected", lateness(patch, "2026-10-12", due + 47 * 3_600_000)?.rule, "patch-change-under-48h");
+eq("patch change 49 h late: extra contraception", lateness(patch, "2026-10-12", due + 49 * 3_600_000)?.rule, "patch-change-over-48h");
+eq("not late before the time", lateness(patch, "2026-10-12", due - 60_000), null);
+const ringOut = Date.parse("2026-10-26T08:00:00Z"); // 09:00 CET
+eq("ring left in 3 days longer: still fine", lateness(ring, "2026-10-26", ringOut + 3 * 86_400_000)?.rule, "ring-remove-late");
+eq("ring in more than 4 weeks: not protected", lateness(ring, "2026-10-26", ringOut + 7 * 86_400_000 + 3_600_000)?.rule, "ring-over-4-weeks");
+eq("new ring 2 h late: fine", lateness({ ...ring, packStart: "2026-11-02" }, "2026-11-02", Date.parse("2026-11-02T10:00:00Z")), null);
+eq("new ring 4 h late: late", lateness({ ...ring, packStart: "2026-11-02" }, "2026-11-02", Date.parse("2026-11-02T12:00:00Z"))?.rule, "ring-insert-late");
+const shotDue = Date.parse("2026-12-28T08:00:00Z");
+eq("injection 2 weeks late = 14 weeks: still within", lateness(shot, "2026-12-28", shotDue + 14 * 86_400_000)?.rule, "injection-due");
+eq("injection later than 14 weeks: not certain", lateness(shot, "2026-12-28", shotDue + 15 * 86_400_000)?.rule, "injection-over-14-weeks");
+
+// Moving the cycle (late or early cycle start)
+const ringMoved: Plan = { ...ring, earlierPackStarts: ["2026-10-05"], packStart: "2026-11-04", takenDays: { "2026-10-05": "09:00", "2026-10-26": "09:00", "2026-11-04": "10:00" } };
+eq("late new ring: the scheduled day counts as done late", [isTaken(ringMoved, "2026-11-02"), movedTo(ringMoved, "2026-11-02")], [true, "2026-11-04"]);
+eq("…recorded on the actual day", doneAt(ringMoved, "2026-11-02"), { day: "2026-11-04", time: "10:00" });
+eq("…and the next removal counts from it", actionOn(ringMoved, "2026-11-25"), "remove");
+eq("…no reminder for the moved day", reminderTimes(ringMoved, "2026-11-03"), []);
+const shotEarly: Plan = { ...shot, earlierPackStarts: ["2026-10-05"], packStart: "2026-12-14", takenDays: { "2026-10-05": "09:00", "2026-12-14": "11:00" } };
+eq("early injection (week 10): the old date isn't due any more", actionOn(shotEarly, "2026-12-28"), null);
+eq("…the next one is 12 weeks later", nextAction(shotEarly, "2026-12-15"), { day: "2027-03-08", action: "inject" });
+eq("a mid-cycle change never moves the cycle", movedTo({ ...patch, earlierPackStarts: ["2026-10-05"], packStart: "2026-10-13" }, "2026-10-12"), null);
+
+// Recording actions (what the app writes)
+const ringDue: Plan = { ...ring, takenDays: { "2026-10-05": "09:00", "2026-10-26": "09:00" } };
+const inserted = withAction(ringDue, "2026-11-02", { day: "2026-11-02", time: "09:10" });
+eq("on time: just the time", [inserted.takenDays["2026-11-02"], inserted.packStart], ["09:10", "2026-10-05"]);
+const late = withAction(ringDue, "2026-11-02", { day: "2026-11-04", time: "10:00" });
+eq("new ring 2 days late: the cycle moves there", [late.packStart, late.earlierPackStarts, late.takenDays["2026-11-04"], "2026-11-02" in late.takenDays], ["2026-11-04", ["2026-10-05"], "10:00", false]);
+eq("…removal 3 weeks after the actual insert", actionOn(late, "2026-11-25"), "remove");
+const undone = withAction(late, "2026-11-02", null);
+eq("undoing the late insert moves the cycle back", [undone.packStart, undone.earlierPackStarts, "2026-11-04" in undone.takenDays], ["2026-10-05", [], false]);
+const relate = withAction(late, "2026-11-02", { day: "2026-11-03", time: "08:00" });
+eq("correcting the late day re-moves it", [relate.packStart, relate.earlierPackStarts, "2026-11-04" in relate.takenDays], ["2026-11-03", ["2026-10-05"], false]);
+const midLate = withAction({ ...patch, takenDays: { "2026-10-05": "09:00" } }, "2026-10-12", { day: "2026-10-13", time: "08:15" });
+eq("late mid-cycle patch change: recorded with its day, cycle unchanged", [midLate.takenDays["2026-10-12"], midLate.packStart], ["2026-10-13T08:15", "2026-10-05"]);
+const earlyShot = withAction({ ...shot, takenDays: { "2026-10-05": "09:00" } }, "2026-12-28", { day: "2026-12-14", time: "11:00" });
+eq("early injection: the cycle moves back to it", [earlyShot.packStart, earlyShot.earlierPackStarts, actionOn(earlyShot, "2026-12-28")], ["2026-12-14", ["2026-10-05"], null]);
+
+// Followers' late alerts for the other methods
+const patchLate: Plan = { ...patch, lateMinutes: 60, takenDays: { "2026-10-05": "09:00" } };
+eq("patch: followers hear about it a day late, at the reminder time", iso(nextLateAt(patchLate, Date.parse("2026-10-12T08:00:00Z"))), "2026-10-13T07:00:00.000Z");
+eq("…not on the day itself", lateTime(patchLate, "2026-10-12"), null);
+eq("…not when done", lateTime({ ...patchLate, takenDays: { ...patchLate.takenDays, "2026-10-12": "09:30" } }, "2026-10-13"), null);
+eq("injection: a week late", iso(lateTime({ ...shot, lateMinutes: 60, takenDays: { "2026-10-05": "09:00" } }, "2027-01-04")), "2027-01-04T08:00:00.000Z");
+eq("next reminder of an injection plan is weeks ahead", iso(nextReminderAt({ ...shot, takenDays: { "2026-10-05": "09:00" } }, Date.parse("2026-10-06T00:00:00Z"))), "2026-12-28T08:00:00.000Z");
+// Injection: a heads-up 7 days before (time to book the appointment), moved along by an early injection.
+const shotDone: Plan = { ...shot, takenDays: { "2026-10-05": "09:00" } };
+eq("injection notice 7 days before it's due", iso(nextNoticeAt(shotDone, Date.parse("2026-10-06T00:00:00Z"))), "2026-12-21T08:00:00.000Z");
+eq("noticesAt names the injection notice", noticesAt(shotDone, Date.parse("2026-12-21T08:00:00Z")), ["injection"]);
+eq("after the notice, the next one is a cycle later", iso(nextNoticeAt({ ...shotDone, takenDays: { ...shotDone.takenDays, "2026-12-28": "09:00" } }, Date.parse("2026-12-21T08:00:00Z"))), "2027-03-15T08:00:00.000Z");
+eq("no injection notice for a patch", nextNoticeAt({ ...patch, takenDays: {} }, Date.parse("2026-10-06T00:00:00Z")), null);
+eq("actionKey tells patch and ring removal apart", [actionKey(patch, "remove"), actionKey({ method: "ring" }, "remove"), actionKey(shot, "inject")], ["removePatch", "removeRing", "inject"]);
+eq("pre-setup marks only on action days (patch)", Object.keys(trackFromPackStart({ ...patch, trackingSince: "2026-10-14" }).takenDays), ["2026-10-05", "2026-10-12"]);
 
 console.log(failures ? `\n${failures} FAILED` : "\nAll schedule tests passed.");
 process.exit(failures ? 1 : 0);

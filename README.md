@@ -1,7 +1,7 @@
 # Blister Buddy
 
-A tiny private pill tracker for Android, iPhone (as a home-screen web app) and the browser.
-Owners track their blister pack; subscribers (ID + password) get notified when the pill is due and when it was taken.
+A tiny private contraception tracker (pill, patch, ring, injection) for Android, iPhone (as a home-screen web app) and the browser.
+Owners track their blister pack, patch, ring or injection; followers (username + password) get notified when it's due and when it was done.
 
 ## Architecture (all free tiers)
 
@@ -17,6 +17,10 @@ Owners track their blister pack; subscribers (ID + password) get notified when t
 
 - **Accounts**: email + password through Firebase Auth. Plain Firebase Auth is free on Spark: no per-user cost, and the verification and password-reset emails are free. The app offers register, log in, forgot password, email confirmation, change email (confirmed via a link to the new address), change password, log out (detaches this device's push token) and delete account (removes all of the account's Firestore data in one batch). Sensitive changes ask for the current password. The rules only accept tokens that carry an email.
 - **Personal ID**: random 6-character code claimed when an account first opens the app (`users/{pid}`). It belongs to the account, so it's the same on every device.
+- **Username**: what others see and type to follow. It's unique, changeable at any time (pencil on the username card), and can be 2–24 characters: ASCII 33–126 (no spaces), accented Latin letters, Greek, Cyrillic, Hiragana and Katakana (normalized to NFC). The personal ID stays the internal key of everything (schedule doc, follows, access keys, share keys), so renaming keeps all followers connected.
+  - `usernames/{key}` = `{ pid, ownerUid, username }` makes names unique. `key` = the name lowercased letter by letter, with `%` and `/` escaped (so "Svea" and "svea" are the same name). The same formula is in `src/data.ts` and `firestore.rules`.
+  - The profile shows it as `users/{pid}.username`. The rules only accept a name this profile holds, and claiming, renaming (which frees the old name) and the profile update happen in one batch.
+  - Accounts from before usernames, and new accounts, claim their personal ID as username on first open. Following by a personal ID typed directly keeps working.
 - **Password**: the owner stores `sha256("<pid>:<password>")` in `users/{pid}/private/auth`, which only the owner can read. To subscribe, a client writes that same hash into `users/{pid}/subscribers/{uid}`. The rules only allow the write if it matches, so the password check happens inside Firestore. Changing the password does not remove existing subscribers.
 - **Schedule model** (`shared/schedule.ts`, used by both the app and the Worker): a pack is `pillsPerPack` pills (the last `placebo` of them placebo, still taken daily), then `breakDays` pill-free days, and the next pack starts automatically. Pills are tied to calendar days like a real blister: `packStart` anchors pack 1, and `takenDays` maps each marked day to the time it was marked. A past day marked afterwards stores no time. Days before `trackingSince` (the first setup) count as taken. Presets: 21+7 break, 24+4 placebo, 21+7 placebo, 28 continuous, 84+7 break, or custom.
 - **Reminders**: on every change the app computes `nextReminderAt` and `nextLateAt` with the shared module. The Worker sends due moments and moves them forward:
@@ -25,6 +29,7 @@ Owners track their blister pack; subscribers (ID + password) get notified when t
   - Followers also get "not taken yet" 30 min, 1 h or 2 h after the set time.
   - Nothing is sent on pill-free days or once the pill is marked.
 - **Taken**: marking today's pill sets `takenPending`. Within a minute the Worker tells followers "took today's pill at HH:MM", then clears the flag. Undo is possible, and any past pill day can be corrected from the blister or the history calendar.
+- **Seen** (like a read receipt): followers confirm they've seen that today's pill was taken, with the button next to "Taken at …" on the followed schedule or "Mark as seen" on the notification (Android, and desktop/Android browsers; category `seen`). It writes `users/{pid}/seen/{followerUid}` = `{ day, at, name? }` (`name`: the follower's chosen username, else their schedule name). The owner's hero shows "Seen at 13:40" or "Seen by Bob · 13:40". Unfollowing removes it.
 - **Marking a pill** always asks "Just now" or "Earlier…" (time picker capped at the current time; past days can also be saved without a time). This applies to the home screen, the wizard, the blister, the calendar and the notification's "Taken" button, which opens this sheet.
 - **UI**: design tokens in `src/theme.ts` (colors, gradients, Plus Jakarta Sans, shadows). Shared components are in `src/ui.tsx`. In-app bottom sheets and toasts (`src/sheets.tsx`) replace system alerts on every platform. Icons are Lucide.
 - **Supplies & appointments**: "unopened packs at home" is stored as `supplyPacks`/`supplyFrom`. The owner gets a refill notice when the last pack starts, and an appointment notice the day before at the reminder time. Both use `nextNoticeAt`, which the Worker's fourth job processes.
@@ -40,13 +45,35 @@ Owners track their blister pack; subscribers (ID + password) get notified when t
 
 Why a Worker? Spark can't run Cloud Functions, and sending FCM needs a server holding the service-account key. The Cloudflare Workers free plan includes cron triggers.
 
+## Patch, ring and injection
+
+The schedule can be for the pill, the patch, the vaginal ring or the injection (`users/{pid}.method`; missing means pill). The wizard's first step picks the method. All four use the same cycle model in `shared/schedule.ts`, so reminders, follower notices, "seen", history and supplies work for each of them:
+
+| Method | `pillsPerPack` + `breakDays` | Actions (`actionOn`) | Open after the day (`CARRY_DAYS`) | Follower alert (`LATE_DAYS`) |
+|---|---|---|---|---|
+| Pill | as before | every pill day | 0 (missed) | 30 min – 2 h |
+| Patch | 21 + 7, or 42 + 7 (6 in a row) | new patch on day 0, change every 7 days, off after the wear weeks | 6 days | after 1 day |
+| Ring | 21 + 7, or 21 + 0 | new ring on day 0, out on day 21 | 6 days | after 1 day |
+| Injection | 56, 84 or 91 + 0 | injection on day 0 | 28 days | after 7 days |
+
+- **An action stays open** until it's marked done. The owner's reminder comes back every day at the reminder time ("Patch change overdue · 1 day late"), followers get one alert after `LATE_DAYS`, and a follower reminder only on the scheduled day.
+- **Done on another day:** `takenDays[scheduledDay]` = `"YYYY-MM-DDTHH:MM"` (done day and time) instead of `"HH:MM"`. A cycle start (new patch, new ring, injection) done late or early starts the cycle on that day instead: its day becomes the new `packStart` and the old one moves to `earlierPackStarts` (`withAction`, `movedTo`). A late patch change in mid-cycle keeps the change weekday. An injection can be given from 2 weeks before it's due.
+- **Rules shown when late** (`lateness`, texts `lateRules` in `src/i18n.ts`), from familienplanung.de (linked in the app, with "your leaflet and your doctor know best"):
+  - Patch change under 48 h late: still protected; over 48 h: 7 days extra contraception; first patch late: the change day moves; removal up to 7 days late: still protected.
+  - Ring: new ring more than 3 h late: insert now, extra contraception advised; left in up to 7 days longer: still protected; more than 4 weeks in a row: not protected.
+  - Injection (12-week type): earliest week 10, latest week 14, after that protection isn't certain. A hint after about 2 years of use.
+- **Views** (`src/methods/`): `PatchStrip` (one tile per week), `RingDial` (a dial of the cycle's days), `InjectionWindow` (earliest / due / latest bar with today's position). The hero (`MethodSchedule`) shows the next action, its button opens `openActionSheet` ("Just now", or an earlier day and time; change or undo). Followers see the same view read-only and a badge per method.
+- **Setup:** the injection asks for the date of the last one. Tracking starts there, so an injection that's already overdue shows as open.
+- **History** marks only action days (done, late in amber, missed) and tints the days in between (patch on / ring in).
+- **Worker:** texts per action in English and German, the button "Done ✓" (notification category `action`), and for the injection a notice 7 days before it's due ("book your appointment", `noticesAt` kind `injection`). Supplies count cycles for patch and ring; the injection has no supply row.
+
 ## Web hosting and stale pages
 
 Firebase Hosting has no catch-all rewrite (the app has a single page, `/`), so a script that no longer exists is a 404 instead of `index.html`. `/` and `/index.html` are never cached, while the content-hashed files under `/_expo/` and `/assets/` are cached for a year. `public/index.html` shows a start screen in plain HTML (icon and spinner) until the app calls `bbStarted()`. It reloads itself once if the app script fails to load or run (a stale cached page after an update), and after 10 seconds without a start it shows the error and a reload button. The app waits at most 3 seconds for its fonts and then starts with system fonts, and `ErrorBoundary` shows the error message with a reload button instead of an empty screen.
 
-## Kitten mascot
+## Nyxi, the kitten mascot
 
-A small kitten (white, red sweater with a heart) lives on the home screen. Code in `src/mascot/`:
+Nyxi, a small kitten (white, red sweater with a heart), lives on the home screen and introduces itself on the first open. Code in `src/mascot/`:
 - `art.tsx`: the drawing, split into parts (tail, legs, body, paws, collar, ears, head, eyes, muzzle) that share one 200×236 box.
 - `Kitten.tsx`: the puppet. Each part sits on its own `Animated.View` with a pivot (`transformOrigin`), so blinking, breathing, the tail, ear twitches, walking and climbing run on the native animation driver.
 - `world.tsx`: where it lives.
@@ -57,15 +84,19 @@ A small kitten (white, red sweater with a heart) lives on the home screen. Code 
   - If it ever fails to render, the home screen continues without it.
 - `brain.ts`: pure logic, unit-tested in `scripts/test-mascot.ts`. Decides what it says, by priority:
   - today's pill reminder (own schedule, after the reminder time; "Later" snoozes 30 min)
-  - a greeting on the first open of the day
+  - a greeting on the first open of the day (an introduction the very first time)
   - "How are you feeling?" once a day without a note, which leads to the note card
-  - one health fact a day, up to 3 on request
+  - good night once per evening from 21:00, after the mood question
+  - Greetings, the celebration after the pill, good night and petting come from pools of lines in English and German (`mascotGreet`, `mascotYay`, `mascotPurr` in `src/i18n.ts`). About half the time Nyxi uses the variant with your username, but only if you chose one; the automatic personal ID isn't used as a name.
+  - one automatic health fact a day, unless you already got one; more on request ("Another one", or a tap). After you decline one, Nyxi offers again on every third tap.
+  - Bubbles are built from the current language, so an open one follows the EN/DE switch.
   - It celebrates when today's pill gets marked, and naps after 2 minutes alone.
 - `facts.ts`: the facts in English and German, each with its source (NHS, WHO, gesund.bund.de, familienplanung.de, RKI, OHSU) and a **tag** (a subject slug). The database is meant to keep growing:
   - [docs/mascot-facts-index.md](docs/mascot-facts-index.md) is a short lookup table of all tags per topic. Read it to see what's covered; no need to read the facts. Near-duplicates are fine.
   - `node scripts/facts-index.ts` validates the facts (both languages, bubble length, https source, no identical text twice) and regenerates the index and [docs/mascot-facts.md](docs/mascot-facts.md) (the full list for review). `node scripts/facts-index.ts find <word>` searches; `--check` is for CI.
-  - Adding a fact is described at the top of the index. Android apps get new facts with the next release; the web app with the next deploy.
-- `store.ts`: per-device settings (Account → Kitten: show it, health facts) and memory (facts shown, daily counters), in AsyncStorage.
+  - Adding a fact is described at the top of the index.
+  - Finding the fact behind a bubble (e.g. to fix a translation): each shown fact is logged in the browser console as `[Nyxi] fact FACTS[79] tag "uti-dont-hold"`, and `nyxiFact` in the console holds the current one. Search facts.ts for the tag, edit `en`/`de`, then run `node scripts/facts-index.ts`. Android apps get new facts with the next release; the web app with the next deploy.
+- `store.ts`: per-device settings (Account → Nyxi: show it, health facts) and memory (facts shown, daily counters), in AsyncStorage.
 - Reduced motion (system setting): it sits still.
 
 ## End-to-end encryption

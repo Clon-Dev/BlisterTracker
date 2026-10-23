@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Animated, AppState, Platform, Pressable, ScrollView, Text, useColorScheme, useWindowDimensions, View } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
@@ -9,10 +9,10 @@ import { LinearGradient } from "expo-linear-gradient";
 import { onAuthStateChanged, type User } from "firebase/auth";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
-  AlertTriangle, BellRing, CalendarDays, Check, Clock3, Copy, Eye, EyeOff, KeyRound, LockKeyhole, MailWarning, Moon, Pencil, Pill, Plus, SkipForward, SlidersHorizontal, Tag,
+  AlertTriangle, AtSign, BellRing, CalendarDays, Check, CheckCheck, Clock3, Copy, Eye, EyeOff, KeyRound, LockKeyhole, MailWarning, Moon, Pencil, Pill, Plus, SkipForward, SlidersHorizontal, Tag,
   UserMinus, UserPlus, UserRound, type LucideIcon,
 } from "lucide-react-native";
-import { addDays, cycleLength, dayKey, firstEditableDay, isTaken, slot, trackFromPackStart, zonedTime } from "./shared/schedule";
+import { actionOn, addDays, clock, cycleLength, dayKey, diffDays, doneOn, firstEditableDay, isTaken, methodOf, openActionDay, slot, trackFromPackStart, zonedTime } from "./shared/schedule";
 import { auth } from "./src/firebase";
 import { AccountScreen } from "./src/AccountScreen";
 import { setAuthLanguage, resendVerification, takePendingPassword } from "./src/auth";
@@ -22,20 +22,23 @@ import { createKeyring, followedShareKey, loadCachedKey, ownShareKey, syncKeyrin
 import { AuthScreen } from "./src/AuthScreen";
 import { Blister } from "./src/Blister";
 import {
-  deviceTz, ensureAccount, fetchSharing, hasSchedule, migrateToEncryption, openNotes, registerToken, renameSchedule, setAccountLang, setTaken,
-  setTimezone, todayOf, unsubscribe, watchAccount, watchNotes, watchProfile, watchSubscriberCount,
-  type Account, type Notes, type Profile, type Schedule, type Sharing, type StoredNotes,
+  deviceTz, recordAction, ensureAccount, cleanUsername, ensureUsername, fetchSharing, hasSchedule, markSeen, setUsername, USERNAME_MAX, usernameAvailable, validUsername, migrateToEncryption, openNotes, registerToken, renameSchedule, setAccountLang, setTaken,
+  setTimezone, todayOf, unsubscribe, watchAccount, watchNotes, watchOwnSeen, watchProfile, watchSeen, watchSubscriberCount,
+  type Account, type Notes, type Profile, type Schedule, type Seen, type Sharing, type StoredNotes,
 } from "./src/data";
 import { NoteCard, NoteLine, openEarlyPackSheet, SuppliesCard, TravelNotice, UpdateCard, type OwnNote } from "./src/HomeCards";
 import { checkForUpdate, type Release } from "./src/update";
+import { openActionSheet } from "./src/methods/ActionSheet";
+import { MethodSchedule, MethodVisual } from "./src/methods/MethodSchedule";
+import { methodStatus } from "./src/methods/status";
 import type { PillState } from "./src/mascot/brain";
 import { loadMascot } from "./src/mascot/store";
 import { MascotProvider, MascotSpot, useMascotScroll } from "./src/mascot/world";
 import { PasswordForm, ScheduleWizard, SubscribeForm } from "./src/Forms";
 import { HistoryScreen } from "./src/HistoryScreen";
-import { formatDay, loadSavedLang, useI18n, type Lang, type Strings } from "./src/i18n";
+import { formatDay, loadSavedLang, strings, useI18n, type Lang, type Strings } from "./src/i18n";
 import { missedDays, packCells } from "./src/pack";
-import { enablePush, onTakenAction, pushStatus, registerTakenAction, type PushStatus } from "./src/push";
+import { enablePush, onNotificationAction, pushStatus, registerActions, type PushStatus } from "./src/push";
 import { alert, confirm, openSheet, SheetHost, SheetIcon, toast, ToastHost } from "./src/sheets";
 import { openDaySheet } from "./src/TakenTime";
 import { C, F, fonts, G, loadAppearance, R, setSystemDark, shadow, themedStyles, useThemeVersion } from "./src/theme";
@@ -140,6 +143,8 @@ function Main({ user }: { user: User }) {
   const [sharedNotes, setSharedNotes] = useState<StoredNotes>({});
   const [privateNotes, setPrivateNotes] = useState<StoredNotes>({});
   const [storedFollowedNotes, setFollowedNotes] = useState<Record<string, StoredNotes>>({});
+  const [seen, setSeen] = useState<Seen[]>([]); // followers' confirmations for the own schedule
+  const [followedSeen, setFollowedSeen] = useState<Record<string, Seen | null>>({}); // own confirmations per followed schedule
   const [keptZones, setKeptZones] = useState<string | null>(null);
   const [release, setRelease] = useState<Release | null>(null);
   const mascotScroll = useMascotScroll();
@@ -225,12 +230,19 @@ function Main({ user }: { user: User }) {
   useEffect(() => {
     if (!pid) return;
     const unsubs = [
-      watchProfile(pid, setOwn), watchSubscriberCount(pid, setSubscriberCount),
+      watchProfile(pid, setOwn), watchSubscriberCount(pid, setSubscriberCount), watchSeen(pid, setSeen),
       watchNotes(pid, "shared", setSharedNotes), watchNotes(pid, "private", setPrivateNotes),
     ];
     return () => unsubs.forEach((u) => u());
   }, [pid]);
   useEffect(() => { if (pid) fetchSharing(pid).then(setSharing, () => undefined); }, [pid, dataKey]);
+  // Accounts from before usernames (and new ones) claim their personal ID as username, once.
+  const claimingUsername = useRef(false);
+  useEffect(() => {
+    if (!pid || !own || own.username || claimingUsername.current) return;
+    claimingUsername.current = true;
+    ensureUsername(uid, pid, own).catch(() => undefined).finally(() => { claimingUsername.current = false; });
+  }, [pid, own]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // One live listener per followed schedule.
   const subsKey = account?.subs.join(",") ?? "";
@@ -242,6 +254,7 @@ function Main({ user }: { user: User }) {
         (profile) => setFollowed((f) => ({ ...f, [p]: profile ?? "denied" })),
         () => setFollowed((f) => ({ ...f, [p]: "denied" }))),
       watchNotes(p, "shared", (n) => setFollowedNotes((f) => ({ ...f, [p]: n }))),
+      watchOwnSeen(p, uid, (sn) => setFollowedSeen((f) => ({ ...f, [p]: sn }))),
     ]);
     return () => unsubs.forEach((u) => u());
   }, [subsKey]);
@@ -284,25 +297,55 @@ function Main({ user }: { user: User }) {
   useEffect(() => { AsyncStorage.getItem("keptZones").then(setKeptZones, () => undefined); }, []);
   const showTravel = !!schedule && schedule.tz !== here && keptZones !== zonePair;
 
+  /** A follower confirms they've seen that `day`'s pill of schedule `p` was taken (card button or notification button). */
+  const confirmSeen = (p: string, day: string) => {
+    // The owner sees "Seen by …": the follower's chosen username, else their schedule name.
+    const chosen = own?.username && own.username !== pid ? own.username : undefined;
+    queued(markSeen(uid, p, day, chosen ?? (own && hasSchedule(own) ? own.name || undefined : undefined)));
+    toast(strings().seenToast);
+  };
+
   /** Opens the day sheet (now / earlier / change / unmark) and saves the choice. */
+  /** Patch / ring / injection: records (or changes, or undoes) the action scheduled on `scheduled`. */
+  const editAction = useCallback(async (sch: Schedule, scheduled: string) => {
+    if (!pid || !actionOn(sch, scheduled)) return;
+    const choice = await openActionSheet(sch, scheduled);
+    if (!choice) return;
+    queued(recordAction(pid, sch, scheduled, "undo" in choice ? null : choice));
+    if (!("undo" in choice)) { celebrate(); toast(t.markedToast); }
+  }, [pid, t]);
+
   const editDay = useCallback(async (sch: Schedule, day: string) => {
+    if (methodOf(sch) !== "pill") return editAction(sch, day);
     if (!pid || slot(sch, day).kind === "break" || day > todayOf(sch) || day < firstEditableDay(sch)) return;
     const action = await openDaySheet(trackFromPackStart(sch), day, lang); // pre-setup pills show as taken (time unknown)
     if (!action) return;
     queued(setTaken(pid, sch, day, "untake" in action ? null : action.time));
     if (!("untake" in action)) { celebrate(); toast(t.markedToast); }
-  }, [pid, lang, t]);
+  }, [pid, lang, t, editAction]);
 
   // "Taken" button on the reminder notification: opens the day sheet once the schedule has loaded
   // (when the button launches the app, the action arrives first).
   const [pendingTaken, setPendingTaken] = useState<{ pid: string; day: string } | null>(null);
-  useEffect(() => { registerTakenAction(t.notificationTaken); }, [t]);
-  useEffect(() => onTakenAction((actionPid, day) => setPendingTaken({ pid: actionPid, day })), []);
+  useEffect(() => { registerActions({ taken: t.notificationTaken, done: t.notificationDone, seen: t.notificationSeen }); }, [t]);
+  // "Mark as seen" on a follower's notification: waits for the own profile, whose schedule name goes with it.
+  const [pendingSeen, setPendingSeen] = useState<{ pid: string; day: string } | null>(null);
+  useEffect(() => onNotificationAction((action, actionPid, day) =>
+    (action === "taken" ? setPendingTaken : setPendingSeen)({ pid: actionPid, day })), []);
+  useEffect(() => {
+    if (!pendingSeen || !own) return;
+    setPendingSeen(null);
+    confirmSeen(pendingSeen.pid, pendingSeen.day);
+  }, [pendingSeen, own]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (!pendingTaken || !pid || !schedule) return;
     setPendingTaken(null);
-    if (pendingTaken.pid === pid && !isTaken(schedule, pendingTaken.day)) editDay(schedule, pendingTaken.day);
-  }, [pendingTaken, pid, schedule, editDay]);
+    if (pendingTaken.pid !== pid) return;
+    if (methodOf(schedule) !== "pill") { // the action still open (it may be carried over from an earlier day)
+      const open = openActionDay(schedule, todayOf(schedule));
+      if (open) editAction(schedule, open);
+    } else if (!isTaken(schedule, pendingTaken.day)) editDay(schedule, pendingTaken.day);
+  }, [pendingTaken, pid, schedule, editDay, editAction]);
 
   if (error) return (
     <View style={{ flex: 1, justifyContent: "center", padding: 24 }}>
@@ -321,12 +364,24 @@ function Main({ user }: { user: User }) {
 
   const home = () => setScreen("home");
   const showHistory = (p: string) => { setHistoryOf(p); setScreen("history"); };
+  const username = own?.username ?? account.pid;
   const historyProfile = historyOf === account.pid ? own : historyOf ? followed[historyOf] : null;
   const historySchedule = historyProfile && historyProfile !== "denied" && hasSchedule(historyProfile) ? historyProfile : null;
 
   // The kitten on the home screen: today's pill (read when it checks, since "overdue" starts with time) and today's note.
+  const methodNow = schedule && methodOf(schedule) !== "pill" ? methodStatus(schedule, todayOf(schedule), Date.now(), t, lang) : null;
   const todayPill = (): PillState => {
     if (!schedule) return null;
+    if (methodOf(schedule) !== "pill") {
+      const st = methodStatus(schedule, todayOf(schedule), Date.now(), t, lang);
+      const open = st.open;
+      return {
+        number: 0, action: open?.key ?? st.doneToday?.key,
+        state: open ? (open.overdue ? "overdue" : "due") : st.doneToday ? "taken" : "break",
+        minutesLate: open ? Math.floor((Date.now() - zonedTime(open.day, schedule.time, schedule.tz)) / 60_000) : 0,
+        soonDays: !open && st.next?.key === "inject" ? diffDays(todayOf(schedule), st.next.day) : undefined,
+      };
+    }
     const info = todayInfo(schedule);
     return { number: info.index + 1, state: info.state, minutesLate: Math.floor((Date.now() - zonedTime(info.day, schedule.time, schedule.tz)) / 60_000) };
   };
@@ -337,7 +392,7 @@ function Main({ user }: { user: User }) {
     <Animated.ScrollView key={`${screen}-${themeVersion}`} ref={mascotScroll.ref} contentContainerStyle={scrollContent} keyboardShouldPersistTaps="handled"
       onScroll={mascotScroll.onScroll} scrollEventThrottle={16} onLayout={mascotScroll.onLayout}>
       {screen === "account" && <AccountScreen user={user} account={account} pushToken={pushToken} onBack={home} onUpdateFound={setRelease} />}
-      {screen === "password" && <PasswordForm uid={uid} pid={account.pid} hasPassword={sharing.set} onSaved={(password) => { setSharing({ set: true, password }); home(); }} onBack={home} />}
+      {screen === "password" && <PasswordForm uid={uid} pid={account.pid} name={username} hasPassword={sharing.set} onSaved={(password) => { setSharing({ set: true, password }); home(); }} onBack={home} />}
       {screen === "subscribe" && <SubscribeForm uid={uid} ownPid={account.pid} onBack={home} />}
       {screen === "schedule" && <ScheduleWizard uid={uid} pid={account.pid} current={own} width={width} onBack={home} />}
       {screen === "history" && historySchedule && (
@@ -347,9 +402,10 @@ function Main({ user }: { user: User }) {
           onEditDay={historyOf === account.pid ? (day) => editDay(historySchedule, day) : undefined} />
       )}
       {screen === "home" && <MascotProvider scroll={mascotScroll} day={today} getPill={todayPill}
-        takenToday={schedule && pillDay ? isTaken(schedule, todayOf(schedule)) : null}
+        takenToday={methodNow ? (methodNow.doneToday ? true : methodNow.open ? false : null) : schedule && pillDay ? isTaken(schedule, todayOf(schedule)) : null}
         hasNoteToday={schedule ? !!ownNotes[todayOf(schedule)] : null}
-        onTakePill={() => schedule && editDay(schedule, todayOf(schedule))} onFocusNote={() => setNoteFocus((n) => n + 1)}>
+        name={own?.username && own.username !== account.pid ? own.username : null}
+        onTakePill={() => schedule && editDay(schedule, openActionDay(schedule, todayOf(schedule)) ?? todayOf(schedule))} onFocusNote={() => setNoteFocus((n) => n + 1)}>
         <View style={st.topBar}>
           <LinearGradient colors={G.primary} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={st.logo}>
             <Pill size={20} color={C.white} strokeWidth={2.4} />
@@ -381,7 +437,16 @@ function Main({ user }: { user: User }) {
         )}
 
         {schedule
-          ? <OwnSchedule schedule={schedule} today={today} width={width} t={t} lang={lang}
+          ? methodOf(schedule) !== "pill"
+            ? <MethodSchedule schedule={schedule} today={todayOf(schedule)} width={width} t={t} lang={lang}
+                onAction={(day) => editAction(schedule, day)} onHistory={() => showHistory(account.pid)} onEdit={() => setScreen("schedule")}
+                onRename={() => openRenameSheet(account.pid, schedule.name, t)}
+                heroFooter={doneOn(schedule, todayOf(schedule)) && <SeenLine seen={seen.filter((x) => seenSinceDone(schedule, x))} tz={schedule.tz} t={t} />}
+                extra={<MascotSpot id="note">
+                  <NoteCard uid={uid} pid={account.pid} day={todayOf(schedule)} note={ownNotes[todayOf(schedule)] ?? null} focusKey={noteFocus} />
+                </MascotSpot>}
+                after={<MascotSpot id="supplies"><SuppliesCard pid={account.pid} schedule={schedule} /></MascotSpot>} />
+            : <OwnSchedule schedule={schedule} today={today} width={width} t={t} lang={lang} seen={seen}
               onEditDay={(day) => editDay(schedule, day)} onHistory={() => showHistory(account.pid)} onEdit={() => setScreen("schedule")}
               onEarlyPack={() => openEarlyPackSheet(account.pid, schedule, lang)}
               onRename={() => openRenameSheet(account.pid, schedule.name, t)}
@@ -391,17 +456,18 @@ function Main({ user }: { user: User }) {
               after={<MascotSpot id="supplies"><SuppliesCard pid={account.pid} schedule={schedule} /></MascotSpot>} />
           : <MascotSpot id="setup"><SetupCard t={t} onCreate={() => setScreen("schedule")} /></MascotSpot>}
 
-        <MascotSpot id="id"><IdCard pid={account.pid} sharing={sharing} followers={subscriberCount} t={t} onPassword={() => setScreen("password")} /></MascotSpot>
+        <MascotSpot id="id"><IdCard username={username} sharing={sharing} followers={subscriberCount} t={t} onPassword={() => setScreen("password")}
+          onEditUsername={() => openSheet<void>((done) => <UsernameSheet uid={uid} pid={account.pid} current={username} t={t} done={done} />)} /></MascotSpot>
 
         <Button title={t.followSchedule} icon={UserPlus} onPress={() => setScreen("subscribe")} style={{ marginTop: 18 }} />
 
         {account.subs.length > 0 && <SectionTitle title={t.following} />}
         {account.subs.map((p) => (
-          <MascotSpot key={p} id={`follow-${p}`}><FollowedSchedule pid={p} profile={followed[p]} notes={followedNotes[p] ?? {}} today={today} width={width} t={t} onHistory={() => showHistory(p)}
+          <MascotSpot key={p} id={`follow-${p}`}><FollowedSchedule seen={followedSeen[p] ?? null} onSeen={(day) => confirmSeen(p, day)} pid={p} profile={followed[p]} notes={followedNotes[p] ?? {}} today={today} width={width} t={t} onHistory={() => showHistory(p)}
             canRead={!!followedShareKey(p, keyring)} onUnlock={(name) => openUnlockSharedSheet(uid, p, name)}
             onRemove={async () => {
               const f = followed[p];
-              const name = (f && f !== "denied" && f.name) || p;
+              const name = (f && f !== "denied" && (f.name || f.username)) || p;
               if (await confirm({ title: t.unsubscribeTitle, message: t.unsubscribeBody({ name }), confirmLabel: t.unsubscribe, destructive: true, icon: UserMinus })) {
                 queued(unsubscribe(uid, p));
               }
@@ -459,6 +525,17 @@ function todayInfo(sch: Schedule): Today {
 }
 
 function StatusBadge({ sch, t }: { sch: Schedule; t: Strings }) {
+  const { lang } = useI18n();
+  if (methodOf(sch) !== "pill") {
+    const st = methodStatus(sch, todayOf(sch), Date.now(), t, lang);
+    if (st.open) {
+      const late = st.open.daysLate > 0 || st.open.overdue;
+      return <Badge tone={late ? "danger" : "primary"} icon={late ? AlertTriangle : BellRing}
+        label={st.open.daysLate ? `${t.actionLate({ what: t.actionName[st.open.key] })} · ${t.daysLate({ n: st.open.daysLate })}` : t.actionTodo[st.open.key]} />;
+    }
+    if (st.doneToday) return <Badge tone="success" icon={Check} label={t.doneAt({ what: t.actionPast[st.doneToday.key], time: st.doneToday.time })} />;
+    return <Badge tone="neutral" icon={CalendarDays} label={st.position} />;
+  }
   const info = todayInfo(sch);
   const time = sch.takenDays[info.day];
   if (info.state === "break") return <Badge tone="neutral" icon={Moon} label={t.heroBreak} />;
@@ -496,8 +573,10 @@ function Legend({ t, sch }: { t: Strings; sch: Schedule }) {
   );
 }
 
-function OwnSchedule({ schedule, today, width, t, lang, onEditDay, onHistory, onEdit, onEarlyPack, onRename, extra, after }: {
+function OwnSchedule({ schedule, today, width, t, lang, seen, onEditDay, onHistory, onEdit, onEarlyPack, onRename, extra, after }: {
   schedule: Schedule; today: string; width: number; t: Strings; lang: Lang;
+  /** Followers' "seen" confirmations (shown under today's taken time). */
+  seen: Seen[];
   onEditDay: (day: string) => void; onHistory: () => void; onEdit: () => void; onEarlyPack: () => void; onRename: () => void;
   /** Rendered between the hero and the pack card / after the pack card. */
   extra: React.ReactNode; after: React.ReactNode;
@@ -531,6 +610,7 @@ function OwnSchedule({ schedule, today, width, t, lang, onEditDay, onHistory, on
             <Text style={[s.eyebrow, { color: "rgba(255,255,255,0.75)" }]}>{isBreak ? t.breakOf({ n, total }) : t.today}</Text>
             <Text style={[s.h1, { color: C.white, marginTop: 4 }]}>{headline}</Text>
             <Text style={[s.small, { color: "rgba(255,255,255,0.85)", marginTop: 4 }]}>{sub}</Text>
+            {info.state === "taken" && <SeenLine seen={seen.filter((x) => x.day === info.day)} tz={schedule.tz} t={t} />}
           </View>
         </View>
         {!isBreak && (info.state === "taken"
@@ -587,15 +667,60 @@ function RenameSheet({ pid, current, t, done }: { pid: string; current: string; 
   );
 }
 
-function IdCard({ pid, sharing, followers, t, onPassword }: { pid: string; sharing: Sharing; followers: number; t: Strings; onPassword: () => void }) {
+/** Changes the own username (awaited: the server decides whether it's free). */
+function UsernameSheet({ uid, pid, current, t, done }: { uid: string; pid: string; current: string; t: Strings; done: () => void }) {
+  const [name, setName] = useState(current);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const trimmed = cleanUsername(name);
+  const valid = validUsername(trimmed);
+  const save = async () => {
+    if (!valid || busy || trimmed === current) return;
+    setBusy(true);
+    setError(null);
+    try {
+      if (!(await usernameAvailable(trimmed, pid))) return setError(t.usernameTaken);
+      await setUsername(uid, pid, trimmed, current);
+      done();
+      toast(t.usernameSaved);
+    } catch (e) {
+      // Claimed by someone else in the meantime: the rules reject it.
+      setError((e as { code?: string }).code === "permission-denied" ? t.usernameTaken : errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <View>
+      <SheetIcon icon={AtSign} />
+      <Text style={s.h1}>{t.usernameTitle}</Text>
+      <Text style={[s.muted, { marginTop: 8 }]}>{t.usernameIntro}</Text>
+      <Field label={t.idLabel} icon={AtSign} value={name} onChangeText={(v) => { setName(v); setError(null); }} maxLength={USERNAME_MAX}
+        autoCapitalize="none" autoCorrect={false} autoFocus onSubmitEditing={save} error={error ?? (trimmed && !valid ? t.usernameInvalid : null)} />
+      <Text style={[s.small, { marginTop: 10 }]}>{t.usernameRules}</Text>
+      <Button title={t.usernameSave} icon={Check} disabled={!valid || trimmed === current} busy={busy} onPress={save} style={{ marginTop: 20 }} />
+    </View>
+  );
+}
+
+/** Big on the card, smaller for long names; Japanese characters count about double (they're wider). */
+const usernameFontSize = (name: string) => {
+  const width = [...name].reduce((w, c) => w + (c >= "\u3040" ? 1.8 : 1), 0);
+  return width <= 8 ? 32 : width <= 12 ? 25 : width <= 18 ? 20 : width <= 26 ? 18 : 15; // long names take two lines
+};
+
+function IdCard({ username, sharing, followers, t, onPassword, onEditUsername }: {
+  username: string; sharing: Sharing; followers: number; t: Strings; onPassword: () => void; onEditUsername: () => void;
+}) {
   const passwordSet = sharing.set;
   const [revealed, setRevealed] = useState(false);
   return (
     <Card>
       <Text style={s.eyebrow}>{t.yourId}</Text>
-      <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 6 }}>
-        <Text selectable style={st.pid} testID="personal-id">{pid}</Text>
-        <IconButton icon={Copy} label={t.copy} onPress={() => Clipboard.setStringAsync(pid).then(() => toast(t.copiedBody({ pid })))} />
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginTop: 6 }}>
+        <Text selectable numberOfLines={2} testID="personal-id" style={[st.pid, { fontSize: usernameFontSize(username) }]}>{username}</Text>
+        <IconButton icon={Pencil} label={t.editUsername} onPress={onEditUsername} />
+        <IconButton icon={Copy} label={t.copy} onPress={() => Clipboard.setStringAsync(username).then(() => toast(t.copiedBody({ name: username })))} />
       </View>
       <View style={st.divider} />
       <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
@@ -622,18 +747,22 @@ function IdCard({ pid, sharing, followers, t, onPassword }: { pid: string; shari
   );
 }
 
-function FollowedSchedule({ pid, profile, notes, today, width, t, onHistory, onRemove, canRead, onUnlock }: {
+function FollowedSchedule({ pid, profile, notes, today, width, t, onHistory, onRemove, canRead, onUnlock, seen, onSeen }: {
   pid: string; profile: Followed; notes: Notes; today: string; width: number; t: Strings; onHistory: () => void; onRemove: () => void;
+  /** This follower's own "seen" confirmation; `onSeen(day)` confirms today's taken pill. */
+  seen: Seen | null; onSeen: (day: string) => void;
   /** This account holds the schedule's share key; otherwise shared notes need the sharing password once. */
   canRead: boolean; onUnlock: (name: string) => void;
 }) {
+  const { lang } = useI18n();
   const sch = profile && profile !== "denied" && hasSchedule(profile) ? profile : null;
   const todaysNote = sch ? notes[todayOf(sch)] : undefined;
   const someLocked = Object.values(notes).some((n) => n.locked);
   // The key can be fetched once the owner has published it; until then there is nothing to enter.
   const canUnlock = !!sch?.shareKeyWrap && (!canRead || someLocked);
   const waiting = !!sch && !sch.shareKeyWrap && someLocked;
-  const name = sch?.name || pid;
+  const handle = (profile && profile !== "denied" && profile.username) || pid;
+  const name = sch?.name || handle;
   return (
     <Card>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 14 }}>
@@ -642,17 +771,25 @@ function FollowedSchedule({ pid, profile, notes, today, width, t, onHistory, onR
         </LinearGradient>
         <View style={{ flex: 1 }}>
           <Text style={s.h2} numberOfLines={1}>{name}</Text>
-          {sch?.name ? <Text style={s.small}>{pid}</Text> : null}
+          {sch?.name ? <Text style={s.small}>{handle}</Text> : null}
         </View>
       </View>
-      {sch && <View style={{ marginTop: 14 }}><StatusBadge sch={sch} t={t} /></View>}
+      {sch && (
+        <View style={{ marginTop: 14, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
+          <StatusBadge sch={sch} t={t} />
+          {(methodOf(sch) === "pill" ? todayInfo(sch).state === "taken" : !!doneOn(sch, todayOf(sch))) &&
+            <SeenButton seen={!!seen && seenSinceDone(sch, seen)} t={t} onPress={() => onSeen(todayOf(sch))} />}
+        </View>
+      )}
       {profile === undefined && <ActivityIndicator color={C.primary} style={{ marginTop: 14 }} />}
       {profile === "denied" && <Text style={[s.muted, { marginTop: 12 }]}>{t.noLongerAvailable}</Text>}
       {profile && profile !== "denied" && !sch && <Text style={[s.muted, { marginTop: 12 }]}>{t.noScheduleYet}</Text>}
       {todaysNote && <View style={{ marginTop: 12 }}><NoteLine note={todaysNote} label={t.todaysNote} /></View>}
       {canUnlock && <Button title={t.unlockSharedNotes} kind="secondary" compact icon={LockKeyhole} onPress={() => onUnlock(sch!.name || pid)} />}
       {waiting && <Text style={[s.small, { marginTop: 10, color: C.muted }]}>🔒 {t.notesWaiting}</Text>}
-      {sch && <PackView sch={sch} today={today} width={Math.min(width - 82, 400)} />}
+      {sch && (methodOf(sch) === "pill"
+        ? <PackView sch={sch} today={today} width={Math.min(width - 82, 400)} />
+        : <MethodVisual plan={sch} today={todayOf(sch)} width={width} t={t} lang={lang} />)}
       <View style={[st.divider, { marginBottom: 0 }]} />
       <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
         {sch ? <LinkButton title={t.history} icon={CalendarDays} onPress={onHistory} /> : <View />}
@@ -662,14 +799,55 @@ function FollowedSchedule({ pid, profile, notes, today, width, t, onHistory, onR
   );
 }
 
+/** Under the owner's taken time: who confirmed they've seen it (like a read receipt). */
+/**
+ * A confirmation of today's pill, or of the patch / ring / injection action done today. Methods: only if given after it
+ * was done (a second action on the same day, e.g. after switching methods, isn't seen yet).
+ */
+function seenSinceDone(sch: Schedule, x: Seen) {
+  const today = todayOf(sch);
+  if (x.day !== today) return false;
+  const done = methodOf(sch) === "pill" ? null : doneOn(sch, today);
+  return !done?.time || x.at >= zonedTime(today, done.time, sch.tz);
+}
+
+function SeenLine({ seen, tz, t }: { seen: Seen[]; tz: string; t: Strings }) {
+  if (!seen.length) return null;
+  const names = seen.map((x) => x.name).filter((n): n is string => !!n);
+  const unnamed = seen.length - names.length;
+  const time = clock(Math.max(...seen.map((x) => x.at)), tz);
+  const label = !names.length
+    ? (unnamed === 1 ? t.seenAt({ time }) : t.seenByCount({ n: unnamed, time }))
+    : t.seenByNames({ names: [...names, ...(unnamed ? [t.seenOthers({ n: unnamed })] : [])].join(", "), time });
+  return (
+    <View style={{ flexDirection: "row", alignItems: "center", gap: 6, marginTop: 6 }} accessibilityLabel={label}>
+      <CheckCheck size={15} color={C.white} strokeWidth={2.6} />
+      <Text style={[s.small, F.bold, { color: C.white, flexShrink: 1 }]}>{label}</Text>
+    </View>
+  );
+}
+
+/** Next to a followed schedule's "Taken at …": the follower confirms they're informed. */
+function SeenButton({ seen, t, onPress }: { seen: boolean; t: Strings; onPress: () => void }) {
+  return (
+    <Pressable onPress={onPress} disabled={seen} accessibilityRole="button" accessibilityLabel={seen ? t.seenDone : t.markSeen}
+      accessibilityState={{ disabled: seen }} hitSlop={6}
+      style={({ pressed }) => [st.seenButton, { backgroundColor: seen ? C.successSoft : C.primarySoft }, pressed && { opacity: 0.7 }]}>
+      {seen ? <CheckCheck size={14} color={C.success} strokeWidth={2.6} /> : <Eye size={14} color={C.primaryDeep} strokeWidth={2.4} />}
+      <Text style={[s.small, F.bold, { color: seen ? C.success : C.primaryDeep }]}>{seen ? t.seenDone : t.markSeen}</Text>
+    </Pressable>
+  );
+}
+
 const st = themedStyles(() => ({
+  seenButton: { flexDirection: "row", alignItems: "center", gap: 5, borderRadius: R.full, paddingHorizontal: 11, paddingVertical: 6 },
   topBar: { flexDirection: "row", alignItems: "center", gap: 10, marginTop: 6, marginBottom: 4 },
   logo: { width: 38, height: 38, borderRadius: 12, alignItems: "center", justifyContent: "center" },
   hero: { borderRadius: R.xl, padding: 22, marginTop: 16, overflow: "hidden" },
   heroBubble: { position: "absolute", width: 180, height: 180, borderRadius: 90, backgroundColor: C.white, opacity: 0.1, right: -50, top: -70 },
   notice: { flexDirection: "row", gap: 12, alignItems: "flex-start", borderRadius: R.lg, padding: 14, marginTop: 14 },
   iconDot: { width: 36, height: 36, borderRadius: 18, alignItems: "center", justifyContent: "center" },
-  pid: { ...F.extrabold, fontSize: 34, color: C.text, letterSpacing: 5 },
+  pid: { ...F.extrabold, flex: 1, color: C.text, letterSpacing: 1 },
   divider: { height: 1, backgroundColor: C.border, marginVertical: 14 },
   secret: { flexDirection: "row", alignItems: "center", gap: 8, backgroundColor: C.segment, borderRadius: R.md, paddingVertical: 10, paddingLeft: 14, paddingRight: 8, marginTop: 12 },
   secretText: { ...F.bold, fontSize: 17, color: C.text, marginTop: 2 },

@@ -5,6 +5,9 @@ rules_version = '2';
 //   users/{pid}                     public-ish profile + schedule, readable by owner and subscribers
 //   users/{pid}/private/auth        { key } = sha256("<pid>:<password>"), owner only
 //   users/{pid}/subscribers/{uid}   { key } — creatable only by presenting the matching key
+//   users/{pid}/seen/{uid}          { day, at, name? } — a follower confirms they saw that the pill was taken
+//   usernames/{key}                 { pid, ownerUid, username } — unique, changeable username of a profile;
+//                                   key = usernameKey(username) (lower case, "%" and "/" escaped), as in src/data.ts
 //
 // The Cloudflare worker uses a service account and bypasses these rules.
 service cloud.firestore {
@@ -15,14 +18,39 @@ service cloud.firestore {
     function ownsUser(pid) { return signedIn() && get(userDoc(pid)).data.ownerUid == request.auth.uid; }
 
     function isDay(v) { return v is string && v.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'); }
+    function usernameKey(u) { return u.lower().replace('%', '%25').replace('/', '%2F'); }
+    // The key of a username. lower() here only lowercases A–Z, so for names with other letters (ä, Ж, Σ, …) the app's
+    // Unicode lowercasing can't be recomputed: then the key must at least have the same length, no capitals A–Z,
+    // and the same escaping. Pure ASCII names are checked exactly.
+    function keyFits(u, key) {
+      return usernameKey(u) == key
+        || (u.matches('.*[^!-~].*') && key.size() == usernameKey(u).size() && key.lower() == key && !key.matches('.*[/].*'));
+    }
+    // 2 to 24 characters: ASCII 33–126, accented Latin, Greek, Cyrillic, Hiragana, Katakana (as in src/data.ts).
+    // "__…__" and dot-only IDs are reserved by Firestore.
+    function validUsername(u) {
+      return u is string && u.matches('^[!-~À-ÖØ-öø-ɏͰ-ϿЀ-ԯḀ-ỿ぀-ヿ]{2,24}$') && !u.matches('^__.*__$') && !u.matches('^[.]+$');
+    }
+    // The profile's username (and its key) may only change to an entry this profile holds (claimed in the same batch).
+    // Profiles from version 1.4.0 have no usernameKey yet (ASCII names only, so it can be computed).
+    function usernameUnchangedOrOwned(pid) {
+      let d = request.resource.data;
+      return (d.get('username', null) == resource.data.get('username', null) && d.get('usernameKey', null) == resource.data.get('usernameKey', null))
+        || (validUsername(d.username) && entryHolds(pid, d.username, d.get('usernameKey', usernameKey(d.username))));
+    }
+    function entryHolds(pid, name, key) {
+      let entry = getAfter(/databases/$(database)/documents/usernames/$(key)).data;
+      return entry.pid == pid && entry.username == name;
+    }
     // See shared/schedule.ts for the meaning of the fields.
     function validSchedule(d) {
       return d.keys().hasOnly(['ownerUid', 'name', 'pillsPerPack', 'placebo', 'breakDays', 'packStart', 'trackingSince',
                                'time', 'tz', 'repeatMinutes', 'lateMinutes', 'takenDays',
                                'nextReminderAt', 'nextLateAt', 'takenPending',
                                'earlierPackStarts', 'supplyPacks', 'supplyFrom', 'appointmentDay', 'appointmentNote',
-                               'reminderText', 'nextNoticeAt', 'shareKeyWrap'])
+                               'reminderText', 'nextNoticeAt', 'shareKeyWrap', 'username', 'usernameKey', 'method'])
         && d.name is string && d.name.size() <= 30
+        // Pill pack, patch / ring wear weeks (21 or 42 days), or the injection interval (56, 84 or 91 days).
         && d.pillsPerPack is int && d.pillsPerPack >= 1 && d.pillsPerPack <= 91
         && d.placebo is int && d.placebo >= 0 && d.placebo < d.pillsPerPack
         && d.breakDays is int && d.breakDays >= 0 && d.breakDays <= 14
@@ -45,7 +73,9 @@ service cloud.firestore {
         && (!('shareKeyWrap' in d) || (d.shareKeyWrap is string && d.shareKeyWrap.size() <= 512))
         // 64 characters in the app; emoji can take several UTF-16 units each.
         && (!('reminderText' in d) || (d.reminderText is string && d.reminderText.size() <= 256))
-        && (!('nextNoticeAt' in d) || d.nextNoticeAt == null || d.nextNoticeAt is timestamp);
+        && (!('nextNoticeAt' in d) || d.nextNoticeAt == null || d.nextNoticeAt is timestamp)
+        // Missing: the pill (schedules from before the other methods).
+        && (!('method' in d) || d.method in ['pill', 'patch', 'ring', 'injection']);
     }
 
     match /accounts/{uid} {
@@ -60,6 +90,21 @@ service cloud.firestore {
         && request.resource.data.tokens is list && request.resource.data.tokens.size() <= 5;
     }
 
+    // Usernames: any signed-in user can look one up (to follow); claiming one works only while it's free.
+    match /usernames/{key} {
+      function validEntry(d) {
+        return d.keys().hasOnly(['pid', 'ownerUid', 'username']) && d.ownerUid == request.auth.uid
+          && validUsername(d.username) && keyFits(d.username, key);
+      }
+      allow read: if signedIn();
+      allow create: if signedIn() && validEntry(request.resource.data)
+        && getAfter(userDoc(request.resource.data.pid)).data.ownerUid == request.auth.uid;
+      // Same name with other capitals: the entry stays, with the new spelling.
+      allow update: if signedIn() && resource.data.ownerUid == request.auth.uid
+        && validEntry(request.resource.data) && request.resource.data.pid == resource.data.pid;
+      allow delete: if signedIn() && resource.data.ownerUid == request.auth.uid;
+    }
+
     match /users/{pid} {
       allow create: if signedIn()
         && pid.matches('^[A-HJKMNP-Z2-9]{6}$')
@@ -68,10 +113,12 @@ service cloud.firestore {
       allow update: if signedIn()
         && resource.data.ownerUid == request.auth.uid
         && request.resource.data.ownerUid == resource.data.ownerUid
+        && usernameUnchangedOrOwned(pid)
         && (validSchedule(request.resource.data)
-          // Profile without a schedule yet: only the share-key wrap may be added (sharing password set first).
-          || (request.resource.data.keys().hasOnly(['ownerUid', 'shareKeyWrap'])
-            && request.resource.data.shareKeyWrap is string && request.resource.data.shareKeyWrap.size() <= 512));
+          // Profile without a schedule yet: only the share-key wrap (sharing password set first) and the username.
+          || (request.resource.data.keys().hasOnly(['ownerUid', 'shareKeyWrap', 'username', 'usernameKey'])
+            && (!('shareKeyWrap' in request.resource.data)
+              || (request.resource.data.shareKeyWrap is string && request.resource.data.shareKeyWrap.size() <= 512))));
       allow delete: if signedIn() && resource.data.ownerUid == request.auth.uid;
       allow read: if signedIn() && (resource.data.ownerUid == request.auth.uid
         || exists(/databases/$(database)/documents/users/$(pid)/subscribers/$(request.auth.uid)));
@@ -104,6 +151,17 @@ service cloud.firestore {
           && request.resource.data.keys().hasOnly(['key'])
           && request.resource.data.key == get(/databases/$(database)/documents/users/$(pid)/private/auth).data.key
           && get(userDoc(pid)).data.ownerUid != request.auth.uid;
+        allow read, delete: if signedIn() && (subUid == request.auth.uid || ownsUser(pid));
+      }
+
+      // "Seen" confirmations (like a read receipt): only current followers write their own; the owner reads them.
+      match /seen/{subUid} {
+        allow create, update: if signedIn() && subUid == request.auth.uid
+          && exists(/databases/$(database)/documents/users/$(pid)/subscribers/$(request.auth.uid))
+          && request.resource.data.keys().hasOnly(['day', 'at', 'name'])
+          && isDay(request.resource.data.day)
+          && request.resource.data.at == request.time
+          && (!('name' in request.resource.data) || (request.resource.data.name is string && request.resource.data.name.size() <= 30));
         allow read, delete: if signedIn() && (subUid == request.auth.uid || ownsUser(pid));
       }
     }

@@ -1,14 +1,17 @@
 import { useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { ChevronLeft, ChevronRight } from "lucide-react-native";
-import { addDays, dayKey, firstEditableDay, isTaken, slot, weekday } from "../shared/schedule";
+import { actionOn, addDays, dayKey, doneAt, firstEditableDay, isTaken, methodOf, movedTo, slot, weekday } from "../shared/schedule";
 import type { Note, Schedule } from "./data";
 import { NoteLine, openNoteSheet, type OwnNote } from "./HomeCards";
 import { formatDay, formatMonth, useI18n } from "./i18n";
+import { actionState } from "./methods/MethodViews";
 import { C, F, themedStyles } from "./theme";
 import { Card, Header, IconButton, ProgressRing, s } from "./ui";
 
-type Status = "taken" | "missed" | "break" | "open" | "untracked";
+// Patch / ring / injection add "late" (done on a later day), "moved" (a cycle start done later, which moved the cycle),
+// "wearing" (a day between actions) and "plain" (the injection's days between injections).
+type Status = "taken" | "late" | "moved" | "missed" | "break" | "open" | "untracked" | "wearing" | "plain";
 
 /**
  * Month calendar of a schedule plus the month's notes. Owner only (`ownerPid`/`onEditDay`): correct days and edit notes;
@@ -27,7 +30,21 @@ export function HistoryScreen({ schedule, notes, owner, onEditDay, onBack }: {
   // (the blister shows them popped), so the history shows them as taken too, without a time. They can be
   // corrected like any other day.
   const editableFrom = firstEditableDay(schedule);
+  const method = methodOf(schedule);
+  const pill = method === "pill";
+  // Patch / ring / injection: only action days are marked, and an action stays open (not missed) while it carries over.
+  const methodStatus = (day: string): Status => {
+    if (actionOn(schedule, day)) {
+      if (day < schedule.trackingSince && !(day in schedule.takenDays)) return day >= editableFrom ? "taken" : "untracked";
+      if (movedTo(schedule, day)) return "moved";
+      const state = actionState(schedule, day, today);
+      return state === "done" ? "taken" : state === "late" || state === "missed" ? state : "open";
+    }
+    if (day < schedule.trackingSince) return "untracked";
+    return slot(schedule, day).kind === "break" ? "break" : method === "injection" ? "plain" : "wearing";
+  };
   const status = (day: string): Status => {
+    if (!pill) return methodStatus(day);
     if (day in schedule.takenDays) return "taken"; // a marked day always shows, even if it now falls into a break
     const kind = slot(schedule, day).kind;
     if (day < schedule.trackingSince) return kind !== "break" && day >= editableFrom ? "taken" : "untracked";
@@ -36,14 +53,21 @@ export function HistoryScreen({ schedule, notes, owner, onEditDay, onBack }: {
     return day < today ? "missed" : "open";
   };
   // Today only counts once it's marked; until then its pill is still due, not missed.
-  const counted = days.filter((d) => { const st = status(d); return st === "taken" || st === "missed"; });
-  const takenCount = counted.filter((d) => status(d) === "taken").length;
+  const counted = days.filter((d) => { const st = status(d); return st === "taken" || st === "late" || st === "missed"; });
+  const takenCount = counted.filter((d) => status(d) !== "missed").length;
   // Fixed weeks of 7 (a wrapping row of 1/7-wide cells can round into 6 per row and shift the weekdays).
   const cells: (string | null)[] = [...Array(weekday(first)).fill(null), ...days];
   while (cells.length % 7) cells.push(null);
   const weeks = Array.from({ length: cells.length / 7 }, (_, w) => cells.slice(w * 7, w * 7 + 7));
   const rate = counted.length ? takenCount / counted.length : 0;
   const monthNotes = days.filter((d) => notes[d]).reverse();
+  const legend: [Status, string][] = pill
+    ? [["taken", t.legendTaken], ["missed", t.legendMissed], ["break", t.legendBreak]]
+    : [
+      ["taken", t.legendDone], ["late", t.legendLate], ["missed", t.legendMissed],
+      ...(method === "injection" ? [] : [["wearing", t.legendWearing[method]] as [Status, string]]),
+      ...(method !== "injection" && schedule.breakDays > 0 ? [["break", t.legendFree[method]] as [Status, string]] : []),
+    ];
 
   const shift = (n: number) => setMonth(({ year, month: m }) => {
     const d = new Date(Date.UTC(year, m + n, 1));
@@ -60,9 +84,9 @@ export function HistoryScreen({ schedule, notes, owner, onEditDay, onBack }: {
             <Text style={[F.extrabold, { fontSize: 20, color: C.text }]}>{Math.round(rate * 100)}%</Text>
           </ProgressRing>
           <View style={{ flex: 1, gap: 8 }}>
-            <Text style={s.h2}>{t.monthStats({ taken: takenCount, due: counted.length })}</Text>
+            <Text style={s.h2}>{pill ? t.monthStats({ taken: takenCount, due: counted.length }) : t.monthStatsMethod({ done: takenCount, due: counted.length })}</Text>
             <View style={{ flexDirection: "row", gap: 14 }}>
-              <Stat color={C.success} label={t.legendTaken} n={takenCount} />
+              <Stat color={C.success} label={pill ? t.legendTaken : t.legendDone} n={takenCount} />
               <Stat color={C.danger} label={t.legendMissed} n={counted.length - takenCount} />
             </View>
           </View>
@@ -84,21 +108,28 @@ export function HistoryScreen({ schedule, notes, owner, onEditDay, onBack }: {
           {week.map((day, i) => {
             if (!day) return <View key={`pad${i}`} style={st.col} />;
             const stt = status(day);
-            const placebo = slot(schedule, day).kind === "placebo";
-            const time = stt === "taken" ? schedule.takenDays[day] || "✓" : undefined;
-            const editable = !!onEditDay && day <= today && day >= editableFrom && stt !== "break";
+            const placebo = pill && slot(schedule, day).kind === "placebo";
+            const moved = stt === "moved" ? movedTo(schedule, day) : null;
+            const time = stt === "taken" || stt === "late" ? (pill ? schedule.takenDays[day] : doneAt(schedule, day)?.time) || "✓" : moved ? `→ ${+moved.slice(8)}` : undefined;
+            const editable = !!onEditDay && day <= today && (pill
+              ? day >= editableFrom && stt !== "break"
+              : !!actionOn(schedule, day) && (day >= schedule.trackingSince || day in schedule.takenDays));
+            const label = stt === "taken" ? (pill ? t.legendTaken : t.legendDone) : stt === "late" || stt === "moved" ? t.legendLate : stt === "missed" ? t.legendMissed
+              : stt === "break" ? (pill ? t.legendBreak : t.legendFree[method as "patch" | "ring"]) : stt === "wearing" ? t.legendWearing[method] : "";
+            // Patch / ring / injection: a dot under an action day that is still to come.
+            const due = !pill && stt === "open";
             return (
               <Pressable key={day} onPress={() => onEditDay?.(day)} disabled={!editable} accessibilityRole="button"
-                accessibilityLabel={`${formatDay(day, lang)}: ${stt === "taken" ? t.legendTaken : stt === "missed" ? t.legendMissed : stt === "break" ? t.legendBreak : ""}`}
+                accessibilityLabel={`${formatDay(day, lang)}: ${label}`}
                 style={[st.col, { alignItems: "center", paddingVertical: 4 }]}>
                 <View style={[st.day, dayStyle[stt], day === today && st.today]}>
                   {notes[day] && <View style={st.noteDot} />}
-                  <Text style={[F.bold, { fontSize: 15, color: stt === "taken" ? C.white : stt === "missed" ? C.danger : stt === "untracked" ? C.muted : C.text }]}>
+                  <Text style={[F.bold, { fontSize: 15, color: stt === "taken" || stt === "late" ? C.white : stt === "missed" ? C.danger : stt === "untracked" ? C.muted : C.text }]}>
                     {+day.slice(8)}
                   </Text>
                 </View>
-                <Text style={[F.semibold, { fontSize: 10, color: C.muted, height: 14, marginTop: 2 }]} numberOfLines={1}>
-                  {time || (placebo && stt !== "untracked" ? "•" : "")}
+                <Text style={[F.semibold, { fontSize: 10, color: due ? C.primary : stt === "late" || stt === "moved" ? C.warning : C.muted, height: 14, marginTop: 2 }]} numberOfLines={1}>
+                  {time || ((placebo && stt !== "untracked") || due ? "•" : "")}
                 </Text>
               </Pressable>
             );
@@ -107,15 +138,15 @@ export function HistoryScreen({ schedule, notes, owner, onEditDay, onBack }: {
           ))}
         </View>
         <View style={st.legend}>
-          {([["taken", t.legendTaken], ["missed", t.legendMissed], ["break", t.legendBreak]] as const).map(([k, label]) => (
+          {legend.map(([k, label]) => (
             <View key={k} style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
               <View style={[{ width: 14, height: 14, borderRadius: 7 }, dayStyle[k]]} />
               <Text style={s.small}>{label}</Text>
             </View>
           ))}
-          <Text style={s.small}>• {t.legendPlacebo}</Text>
+          {pill && <Text style={s.small}>• {t.legendPlacebo}</Text>}
         </View>
-        {onEditDay && <Text style={[s.small, { textAlign: "center", marginTop: 12 }]}>{t.historyHint}</Text>}
+        {onEditDay && <Text style={[s.small, { textAlign: "center", marginTop: 12 }]}>{pill ? t.historyHint : t.historyHintMethod}</Text>}
       </Card>
 
       <Card>
@@ -151,6 +182,10 @@ const st = themedStyles(() => ({
 
 const dayStyle = themedStyles(() => ({
   taken: { backgroundColor: C.success },
+  late: { backgroundColor: C.warning },
+  moved: { borderWidth: 1.5, borderStyle: "dashed", borderColor: C.warning },
+  wearing: { backgroundColor: C.primarySoft },
+  plain: {},
   missed: { backgroundColor: C.dangerSoft, borderWidth: 1.5, borderColor: C.danger },
   break: { borderWidth: 1.5, borderStyle: "dashed", borderColor: C.placeboStroke },
   open: { backgroundColor: C.calendarOpen },
