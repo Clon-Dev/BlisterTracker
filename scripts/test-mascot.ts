@@ -1,5 +1,9 @@
 // Unit tests for src/mascot/brain.ts. Usage: node scripts/test-mascot.ts
-import { forDay, freshMemory, idleAction, NAP_AFTER, nextMessage, offersFact, OFFER_EVERY, pickFact, rememberFact, SNOOZE, type Situation } from "../src/mascot/brain.ts";
+import {
+  forDay, freshMemory, idleAction, NAP_AFTER, nextMessage, pickFact, pickMilestone, pickMyth, rememberAnswer, rememberFact, rememberMilestone, SNOOZE,
+  streakToCelebrate, type Situation,
+} from "../src/mascot/brain.ts";
+import { nyxiAge, specialDay } from "../src/mascot/calendar.ts";
 
 let failures = 0;
 function eq(label: string, got: unknown, want: unknown) {
@@ -73,9 +77,6 @@ m = rememberFact(rememberFact(rememberFact(m, 0, "a", topics.length), 1, "a", to
 eq("starts over once all were shown", m.seen, []);
 
 // Offering facts on a tap
-eq("offers a fact until one is declined", offersFact(null), true);
-eq(`after declining: quiet for ${OFFER_EVERY - 1} taps`, [1, 2].map((n) => offersFact(n)), [false, false]);
-eq(`asks again on tap ${OFFER_EVERY}`, offersFact(OFFER_EVERY), true);
 
 // Day change
 const next = forDay({ ...m, moodAsked: true, hidden: true, snoozeUntil: 5 }, "2026-10-24");
@@ -88,6 +89,54 @@ eq("same day: unchanged", forDay(m, m.day) === m, true);
 eq("naps after a while", idleAction(NAP_AFTER), "nap");
 eq("strolls sometimes", idleAction(1000, () => 0.1), "stroll");
 eq("wanders sometimes", idleAction(1000, () => 0.9), "wander");
+
+// Special days (outfits + a message once a year)
+const sd = (d: string) => specialDay(d)?.id ?? null;
+eq("special days through the year", ["2027-01-01", "2027-02-11", "2027-02-14", "2027-03-08", "2027-03-09", "2027-03-31", "2027-04-01", "2027-05-28", "2027-09-26", "2027-12-24", "2027-12-26", "2027-12-27", "2027-12-31"].map(sd),
+  ["newYear", "science", "valentine", "womensDay", "endometriosis", "endometriosis", null, "menstruation", "contraception", "christmas", "christmas", null, "newYear"]);
+eq("October: pink month, with menopause day, birthday and Halloween on top", ["2027-10-01", "2027-10-17", "2027-10-18", "2027-10-23", "2027-10-30", "2027-10-31", "2027-11-01"].map(sd),
+  ["breastCancer", "breastCancer", "menopause", "birthday", "breastCancer", "halloween", null]);
+eq("an ordinary day has no special", sd("2027-06-15"), null);
+eq("awareness days link their source", ["2027-02-11", "2027-03-08", "2027-05-28", "2027-09-26", "2027-10-05", "2027-10-18"].every((d) => specialDay(d)?.source?.url.startsWith("https://")), true);
+eq("Nyxi's age on its birthday", [nyxiAge("2026-10-23"), nyxiAge("2027-10-23"), nyxiAge("2030-10-23")], [0, 1, 4]);
+
+const intro = freshMemory("2027-03-08");
+const known = { ...freshMemory("2027-03-08"), introduced: true };
+eq("special day: the introduction still comes first on a new device", kind({ openedFor: 2000, special: "womensDay", year: 2027 }, intro), "greet");
+eq("special day instead of the greeting", nextMessage({ ...base, openedFor: 2000, special: "womensDay", year: 2027 }, known), { kind: "special", id: "womensDay" });
+eq("…once a year", kind({ openedFor: 2000, special: "womensDay", year: 2027 }, { ...known, greeted: true, special: { womensDay: 2027 } }), null);
+eq("…again next year", kind({ openedFor: 2000, special: "womensDay", year: 2028 }, { ...known, greeted: true, special: { womensDay: 2027 } }), "special");
+eq("a reminder beats the special day", kind({ openedFor: 2000, special: "womensDay", year: 2027, pill: { number: 4, state: "overdue", minutesLate: 5 } }, known), "reminder");
+
+// Streaks
+eq("no celebration below the first milestone", streakToCelebrate(6, "pill"), null);
+eq("7 pills in a row", streakToCelebrate(7, "pill"), 7);
+eq("…celebrated once", streakToCelebrate(9, "pill", 7), null);
+eq("next milestone 14", streakToCelebrate(14, "pill", 7), 14);
+eq("after a gap the streak starts over", streakToCelebrate(7, "pill", 30), 7);
+eq("patch/ring/injection count actions", [streakToCelebrate(3, "action"), streakToCelebrate(12, "action", 6)], [3, 12]);
+eq("streak celebration comes after a special day", kind({ openedFor: 2000, special: "womensDay", year: 2027, streak: { count: 7, unit: "pill" } }, known), "special");
+eq("streak celebration before the greeting", nextMessage({ ...base, openedFor: 2000, streak: { count: 30, unit: "pill" } }, { ...known, streakSeen: 14 }), { kind: "streak", days: 30 });
+
+// Myth or fact? / herstory picks
+const tags = ["a", "b", "c"];
+eq("quiz: an unasked statement", pickMyth(tags, { ...settled, myths: ["a", "b"] }, () => 0), "c");
+const answered = rememberAnswer(rememberAnswer({ ...settled }, "a", true, 3), "b", true, 3);
+eq("quiz streak counts right answers", [answered.quizStreak, answered.quizBest, answered.myths], [2, 2, ["a", "b"]]);
+const wrong = rememberAnswer(answered, "c", false, 3);
+eq("a wrong answer ends the streak, the best stays, all asked starts over", [wrong.quizStreak, wrong.quizBest, wrong.myths, wrong.mythsFound], [0, 2, [], ["a", "b", "c"]]);
+const items = [{ tag: "x", date: "03-19" }, { tag: "y" }, { tag: "z", date: "06-01" }];
+eq("herstory: a milestone from this date first", pickMilestone(items, "06-01", settled, () => 0), "z");
+eq("herstory: otherwise one not told yet", pickMilestone(items, "01-01", { ...settled, milestones: ["x"] }, () => 0), "y");
+eq("herstory: told on this date already → another", pickMilestone(items, "06-01", { ...settled, milestones: ["z"] }, () => 0), "x");
+eq("herstory: found list for the fact book", rememberMilestone(settled, "y", 3).milestonesFound, ["y"]);
+eq("facts are collected for the fact book", rememberFact(rememberFact(settled, 4, "pill", 10), 2, "cycle", 10).found, [4, 2]);
+
+// Kept across days
+const collected = { ...settled, tapped: true, found: [1], myths: ["a"], quizBest: 3, special: { womensDay: 2027 }, outfits: ["everyday"], streakSeen: 7, crownDay: "2026-10-23", autoFact: true };
+const nextDay = forDay(collected, "2026-10-24");
+eq("a new day keeps what was collected", [nextDay.tapped, nextDay.found, nextDay.myths, nextDay.quizBest, nextDay.special, nextDay.outfits, nextDay.streakSeen], [true, [1], ["a"], 3, { womensDay: 2027 }, ["everyday"], 7]);
+eq("…and resets the daily fields", [nextDay.autoFact, nextDay.greeted], [false, false]);
 
 console.log(failures ? `\n${failures} failed` : "\nall passed");
 process.exitCode = failures ? 1 : 0;

@@ -1,7 +1,7 @@
 // Unit tests for shared/schedule.ts. Usage: node scripts/test-schedule.ts
 import {
   actionKey, actionOn, addDays, appointmentTime, withAction, diffDays, doneAt, doneOn, firstEditableDay, isTaken, lateness, lateTime, movedTo, nextAction, nextLateAt,
-  nextNoticeAt, nextPackStart, nextReminderAt, noticesAt, openActionDay, packsLeft, refillTime, reminderTimes, slot, trackFromPackStart, weekday,
+  nextNoticeAt, nextPackStart, nextReminderAt, noticesAt, openActionDay, packsLeft, refillTime, reminderTimes, slot, streak, trackFromPackStart, weekday,
   zonedTime, type Plan,
 } from "../shared/schedule.ts";
 
@@ -182,6 +182,17 @@ eq("after the notice, the next one is a cycle later", iso(nextNoticeAt({ ...shot
 eq("no injection notice for a patch", nextNoticeAt({ ...patch, takenDays: {} }, Date.parse("2026-10-06T00:00:00Z")), null);
 eq("actionKey tells patch and ring removal apart", [actionKey(patch, "remove"), actionKey({ method: "ring" }, "remove"), actionKey(shot, "inject")], ["removePatch", "removeRing", "inject"]);
 eq("pre-setup marks only on action days (patch)", Object.keys(trackFromPackStart({ ...patch, trackingSince: "2026-10-14" }).takenDays), ["2026-10-05", "2026-10-12"]);
+
+// Streaks (Nyxi's celebrations)
+const taken = (from: string, n: number, skip: string[] = []) => Object.fromEntries(Array.from({ length: n }, (_, i) => addDays(from, i)).filter((d) => !skip.includes(d)).map((d) => [d, "20:00"]));
+const streakPill: Plan = { ...base, packStart: "2026-10-01", trackingSince: "2026-10-01", takenDays: taken("2026-10-01", 21) };
+eq("pill streak: 21 pills, the break doesn't count or break it", streak({ ...streakPill, takenDays: { ...streakPill.takenDays, ...taken("2026-10-29", 3) } }, "2026-10-31"), 24);
+eq("pill streak: today still open doesn't break it", streak({ ...streakPill, takenDays: taken("2026-10-01", 20) }, "2026-10-21"), 20);
+eq("pill streak: a missed pill starts it over", streak({ ...streakPill, takenDays: taken("2026-10-01", 21, ["2026-10-10"]) }, "2026-10-21"), 11);
+eq("pill streak: nothing before the setup counts", streak({ ...streakPill, trackingSince: "2026-10-15" }, "2026-10-21"), 7);
+const streakPatch: Plan = { ...patch, packStart: "2026-10-05", trackingSince: "2026-10-05", takenDays: { "2026-10-05": "09:00", "2026-10-12": "09:00", "2026-10-19": "09:00" } };
+eq("patch streak counts actions on their day", streak(streakPatch, "2026-10-25"), 3);
+eq("patch streak: a change done a day late breaks it", streak({ ...streakPatch, takenDays: { ...streakPatch.takenDays, "2026-10-12": "2026-10-13T09:00" } }, "2026-10-25"), 1);
 
 console.log(failures ? `\n${failures} FAILED` : "\nAll schedule tests passed.");
 process.exit(failures ? 1 : 0);

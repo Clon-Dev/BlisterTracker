@@ -10,6 +10,7 @@ import { appointmentNoteOf, MOODS, setAppointment, setNote, setSupply, startPack
 import { queued } from "./errors";
 import { formatDay, useI18n, type Lang, type Strings } from "./i18n";
 import { alert, openSheet, SheetIcon, toast } from "./sheets";
+import { noteSaved } from "./mascot/store";
 import { downloadAndInstall, type Release } from "./update";
 import { C, F, R, themedStyles } from "./theme";
 import { Badge, Button, Card, Field, LinkButton, s, Stepper, Toggle } from "./ui";
@@ -173,7 +174,7 @@ export function NoteCard({ uid, pid, day, note, focusKey = 0 }: { uid: string; p
         {note && <Badge tone={note.shared ? "primary" : "neutral"} label={note.shared ? t.sharedBadge : t.privateBadge} />}
       </View>
       <NoteEditor key={JSON.stringify(note)} initial={note} focusKey={focusKey}
-        onSave={(n) => { queued(setNote(uid, pid, day, { text: n.text, mood: n.mood }, n.shared, note?.shared ?? null)); toast(t.noteSaved); }} />
+        onSave={(n) => { queued(setNote(uid, pid, day, { text: n.text, mood: n.mood }, n.shared, note?.shared ?? null)); toast(t.noteSaved); noteSaved(n.mood); }} />
     </Card>
   );
 }

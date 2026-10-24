@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Platform, Pressable, Text, View } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import type { User } from "firebase/auth";
-import { AlertCircle, BadgeCheck, Cat, ChevronRight, FileDown, House, KeyRound, LifeBuoy, Lock, LogOut, Mail, MailWarning, RefreshCw, ShieldCheck, SunMoon, Trash2, type LucideIcon } from "lucide-react-native";
+import { AlertCircle, BadgeCheck, BookOpen, Cat, ChevronRight, FileDown, House, KeyRound, LifeBuoy, Lock, LogOut, Mail, MailWarning, RefreshCw, ShieldCheck, SunMoon, Trash2, type LucideIcon } from "lucide-react-native";
 import { authErrorText, changeEmail, changePassword, deleteAccount, logout, resendVerification } from "./auth";
 import { deleteAccountData, removeToken, type Account } from "./data";
 import { openRecoveryCodeSheet } from "./EncryptionScreens";
@@ -14,11 +14,11 @@ import { checkForUpdate, currentVersion, type Release } from "./update";
 import { C, F, G, R, setAppearance, themedStyles, useAppearance, type Appearance } from "./theme";
 import { Badge, Button, Card, ChipGroup, Field, Header, s, Toggle } from "./ui";
 
-export function AccountScreen({ user, account, pushToken, onBack, onUpdateFound, followerOnly, onFollowerOnly, onExport }: {
+export function AccountScreen({ user, account, pushToken, onBack, onUpdateFound, followerOnly, onFollowerOnly, onExport, onFactBook }: {
   user: User; account: Account; pushToken: string | null; onBack: () => void; onUpdateFound: (r: Release) => void;
   /** Hidden "set up your plan" card; null when the account has its own schedule (no card to hide). */
   followerOnly: boolean | null; onFollowerOnly: (v: boolean) => void;
-  onExport: () => void;
+  onExport: () => void; onFactBook: () => void;
 }) {
   const { t } = useI18n();
   const appearance = useAppearance();
@@ -82,6 +82,8 @@ export function AccountScreen({ user, account, pushToken, onBack, onUpdateFound,
         </View>
         <Toggle label={t.mascotShow} value={mascot.enabled} onChange={(enabled) => setMascotSettings({ enabled })} />
         {mascot.enabled && <Toggle label={t.mascotFacts} value={mascot.facts} onChange={(facts) => setMascotSettings({ facts })} />}
+        {mascot.enabled && <Toggle label={t.mascotOutfits} value={mascot.outfits} onChange={(outfits) => setMascotSettings({ outfits })} />}
+        <Button title={t.factBookTitle} icon={BookOpen} kind="secondary" compact onPress={onFactBook} style={{ marginTop: 14 }} />
         <Text style={[s.small, { marginTop: 12 }]}>{t.mascotDisclaimer}</Text>
       </Card>
 

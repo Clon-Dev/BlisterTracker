@@ -75,7 +75,7 @@ Firebase Hosting has no catch-all rewrite (the app has a single page, `/`), so a
 
 ## Nyxi, the kitten mascot
 
-Nyxi, a small kitten (white, red sweater with a heart), lives on the home screen and introduces itself on the first open. Code in `src/mascot/`:
+Nyxi, a small kitten (white, red sweater with a heart), lives on the home screen and introduces itself on the first open, saying what it can do. Content rule for everything it says: only verifiable statements with a reliable source, no opinions, nothing controversial. Code in `src/mascot/`:
 - `art.tsx`: the drawing, split into parts (tail, legs, body, paws, collar, ears, head, eyes, muzzle) that share one 200×236 box.
 - `Kitten.tsx`: the puppet. Each part sits on its own `Animated.View` with a pivot (`transformOrigin`), so blinking, breathing, the tail, ear twitches, walking and climbing run on the native animation driver.
 - `world.tsx`: where it lives.
@@ -90,7 +90,9 @@ Nyxi, a small kitten (white, red sweater with a heart), lives on the home screen
   - "How are you feeling?" once a day without a note, which leads to the note card
   - good night once per evening from 21:00, after the mood question
   - Greetings, the celebration after the pill, good night and petting come from pools of lines in English and German (`mascotGreet`, `mascotYay`, `mascotPurr` in `src/i18n.ts`). About half the time Nyxi uses the variant with your username, but only if you chose one; the automatic personal ID isn't used as a name.
-  - one automatic health fact a day, unless you already got one; more on request ("Another one", or a tap). After you decline one, Nyxi offers again on every third tap.
+  - a special day once a year (instead of the greeting), then a streak milestone with a crown for the day
+  - one automatic health fact a day, unless you already got one (the special day's fact counts)
+  - Reacts to a saved note: happy with 😄/🙂, gentle with 😕/😣 (`noteSaved` in store.ts, called by the note card).
   - Bubbles are built from the current language, so an open one follows the EN/DE switch.
   - It celebrates when today's pill gets marked, and naps after 2 minutes alone.
 - `facts.ts`: the facts in English and German, each with its source (NHS, WHO, gesund.bund.de, familienplanung.de, RKI, OHSU) and a **tag** (a subject slug). The database is meant to keep growing:
@@ -98,7 +100,14 @@ Nyxi, a small kitten (white, red sweater with a heart), lives on the home screen
   - `node scripts/facts-index.ts` validates the facts (both languages, bubble length, https source, no identical text twice) and regenerates the index and [docs/mascot-facts.md](docs/mascot-facts.md) (the full list for review). `node scripts/facts-index.ts find <word>` searches; `--check` is for CI.
   - Adding a fact is described at the top of the index.
   - Finding the fact behind a bubble (e.g. to fix a translation): each shown fact is logged in the browser console as `[Nyxi] fact FACTS[79] tag "uti-dont-hold"`, and `nyxiFact` in the console holds the current one. Search facts.ts for the tag, edit `en`/`de`, then run `node scripts/facts-index.ts`. Android apps get new facts with the next release; the web app with the next deploy.
-- `store.ts`: per-device settings (Account → Nyxi: show it, health facts) and memory (facts shown, daily counters), in AsyncStorage.
+- **Tap menu**: a tap opens 💡 Fact · ❓ Myth or fact? · 💜 Herstory · 🐾 Pet me · 📖 Fact book (a second tap while it's open is a pat; a sideways stroke purrs). A pulsing 💡 badge shows until the first tap, and while today's fact is unseen.
+- `myths.ts` ("Myth or fact?"): statements, each decided by one fact in facts.ts (`tag`); that fact and its source are the explanation, so every answer rests on a checked fact. A right answer grows the quiz streak.
+- `herstory.ts`: milestones in women's history, health and science (suffrage 1918/19, the pill 1960/61, Erxleben, Curie, Tereshkova …), each from the page it links (bpb, Bundestag, UN, ESA, Max Planck Society …). No quotes (often misattributed), no opinions, nothing contested. Milestones on today's date come first ("On this day").
+- `calendar.ts`: special days with an outfit and a message once a year with a sourced fact or milestone: Women and Girls in Science (11 Feb), Valentine's Day, International Women's Day (8 Mar, purple sweater with a fist), Endometriosis Awareness (rest of March, yellow ribbon), Menstrual Hygiene Day (28 May), World Contraception Day (26 Sep), Breast Cancer Awareness Month (October, pink ribbon and bow), World Menopause Day (18 Oct), Nyxi's birthday (23 Oct), Halloween, Christmas, New Year. Outfits are parameters of the drawing (`OUTFITS` in art.tsx: sweater colour, chest motif, hat, bow, scarf, glasses).
+- Streaks: `streak()` in shared/schedule.ts (pills in a row, or patch / ring / injection actions on time); Nyxi celebrates 7, 14, 30, 50, 100, 200, 365 pills (3, 6, 12, 26, 52 actions).
+- `FactBook.tsx` (menu or Account → Nyxi): what Nyxi has told on this device (facts, quiz statements, milestones) with sources, and the wardrobe of outfits worn.
+- `node scripts/facts-index.ts` also validates myths and milestones and writes [docs/mascot-myths.md](docs/mascot-myths.md) and [docs/mascot-herstory.md](docs/mascot-herstory.md) for review.
+- `store.ts`: per-device settings (Account → Nyxi: show it, health facts, special outfits) and memory (facts shown, daily counters, what was discovered, quiz streak, special days greeted, outfits worn), in AsyncStorage.
 - Reduced motion (system setting): it sits still.
 
 ## End-to-end encryption

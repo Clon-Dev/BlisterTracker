@@ -1,7 +1,10 @@
 // The kitten puppet: drawing parts on animated layers (pivots in the 200×236 art box), idle life, walk and climb cycles.
-import { useEffect, useRef, useState } from "react";
-import { Animated, Easing, Platform, Pressable, StyleSheet, View } from "react-native";
-import { ART_H, ART_W, Blush, Body, ClosedEyes, Collar, Ear, Eyes, Haunch, Head, Muzzle, Paw, Shadow, Tail, type Expression, type Mouth } from "./art";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Animated, Easing, PanResponder, Platform, Pressable, StyleSheet, Text, View } from "react-native";
+import {
+  ART_H, ART_W, Blush, Body, Bow, ClosedEyes, Collar, Confetti, Crown, Ear, Eyes, Glasses, Hat, Haunch, Head, Muzzle, OUTFITS, Paw, Shadow, Tail,
+  type Expression, type Mouth, type Outfit,
+} from "./art";
 
 const nativeDriver = Platform.OS !== "web";
 const fill = StyleSheet.absoluteFill;
@@ -23,8 +26,16 @@ type Props = {
   active: boolean;
   reduceMotion: boolean;
   label: string;
+  /** Today's clothes (special days); the everyday red sweater by default. */
+  outfit?: Outfit;
+  /** A golden crown (streak milestone today). */
+  crown?: boolean;
+  /** A pulsing 💡: something new to discover (first tap, today's fact). */
+  badge?: boolean;
   onPress?: () => void;
   onLongPress?: () => void;
+  /** A sideways stroke across the kitten. */
+  onStroke?: () => void;
 };
 
 /** Runs `make()` as an endless animation while `on`; stops and resets when off. */
@@ -40,7 +51,7 @@ function useLoop(on: boolean, make: () => Animated.CompositeAnimation, deps: unk
 const timing = (v: Animated.Value, toValue: number, duration: number, easing = Easing.inOut(Easing.quad)) =>
   Animated.timing(v, { toValue, duration, easing, useNativeDriver: nativeDriver });
 
-export function Kitten({ size, mode, facing, expression, talking, hearts, active, reduceMotion, label, onPress, onLongPress }: Props) {
+export function Kitten({ size, mode, facing, expression, talking, hearts, active, reduceMotion, label, outfit = OUTFITS.everyday, crown, badge, onPress, onLongPress, onStroke }: Props) {
   const k = size / ART_W;
   const height = (size * ART_H) / ART_W;
   const v = useRef({
@@ -53,7 +64,8 @@ export function Kitten({ size, mode, facing, expression, talking, hearts, active
   // Idle life. The walk/climb cycle drives paws, legs and the body bob.
   useLoop(lively && moving, () => {
     v.cycle.setValue(0);
-    return Animated.loop(timing(v.cycle, 1, mode === "climb" ? 440 : 520, Easing.linear));
+    // A slower step rhythm for the bigger body, so the paws keep up with the ground instead of sliding.
+    return Animated.loop(timing(v.cycle, 1, mode === "climb" ? 560 : 680, Easing.linear));
   }, [mode]);
   useLoop(active && mode !== "sleep", () => Animated.loop(Animated.sequence([
     Animated.delay(2600 + Math.random() * 2400), timing(v.blink, 0.08, 70), timing(v.blink, 1, 90),
@@ -77,56 +89,90 @@ export function Kitten({ size, mode, facing, expression, talking, hearts, active
     const id = setInterval(() => setMouthOpen((o) => !o), 170);
     return () => clearInterval(id);
   }, [talking]);
+  // Stroking: a sideways drag across the kitten (a tap still goes to onPress).
+  const strokeRef = useRef(onStroke);
+  strokeRef.current = onStroke;
+  const pan = useMemo(() => PanResponder.create({
+    onMoveShouldSetPanResponderCapture: (_, g) => Math.abs(g.dx) > 10 && Math.abs(g.dx) > Math.abs(g.dy) * 1.5,
+    onPanResponderRelease: (_, g) => { if (Math.abs(g.dx) > 24) strokeRef.current?.(); },
+    onPanResponderTerminationRequest: () => true,
+  }), []);
+
   const mouth: Mouth = expression === "happy" ? "open" : expression === "surprised" ? "o" : mouthOpen ? "open" : "smile";
 
-  const amp = (mode === "climb" ? 9 : 6) * k;
+  const amp = (mode === "climb" ? 11 : 7) * k;
   const step = (phase: 0 | 0.5) => ({
     translateY: v.cycle.interpolate({ inputRange: phase === 0 ? [0, 0.25, 0.5, 1] : [0, 0.5, 0.75, 1], outputRange: [0, phase === 0 ? -amp : 0, phase === 0 ? 0 : -amp, 0] }),
   });
-  const bob = v.cycle.interpolate({ inputRange: [0, 0.25, 0.5, 0.75, 1], outputRange: [0, -2.5 * k, 0, -2.5 * k, 0] });
+  const bob = v.cycle.interpolate({ inputRange: [0, 0.25, 0.5, 0.75, 1], outputRange: [0, -3.5 * k, 0, -3.5 * k, 0] });
+  // A gentle sway from paw to paw while walking (a lean into each reach while climbing).
+  const sway = v.cycle.interpolate({ inputRange: [0, 0.25, 0.5, 0.75, 1], outputRange: mode === "climb" ? ["0deg", "4deg", "0deg", "-4deg", "0deg"] : ["0deg", "2.5deg", "0deg", "-2.5deg", "0deg"] });
   const faceX = Animated.add(Animated.multiply(v.facing, 9 * k), Animated.multiply(v.look, 7 * k));
   const earsX = Animated.multiply(v.facing, 4 * k);
   const breatheY = v.breathe.interpolate({ inputRange: [0, 1], outputRange: [1, mode === "sleep" ? 0.965 : 0.985] });
   const breatheX = v.breathe.interpolate({ inputRange: [0, 1], outputRange: [1, mode === "sleep" ? 1.025 : 1.012] });
 
   return (
+    <View {...pan.panHandlers} style={{ width: size, height }}>
     <Pressable onPress={onPress} onLongPress={onLongPress} delayLongPress={450} accessibilityRole="button" accessibilityLabel={label}
       style={{ width: size, height }} hitSlop={8}>
       <Shadow size={size} />
-      <Animated.View style={[fill, { transform: [{ translateY: bob }] }]}>
+      {outfit.confetti && <Confetti size={size} />}
+      <Animated.View style={[fill, origin(100, 220), { transform: [{ translateY: bob }, { rotate: moving ? sway : "0deg" }] }]}>
         <Animated.View style={[fill, origin(150, 206), { transform: [{ rotate: v.tail.interpolate({ inputRange: [0, 1], outputRange: ["0deg", "-12deg"] }) }] }]}>
           <Tail size={size} />
         </Animated.View>
         <Animated.View style={[fill, { transform: [step(0.5)] }]}><Haunch size={size} side="l" /></Animated.View>
         <Animated.View style={[fill, { transform: [step(0)] }]}><Haunch size={size} side="r" /></Animated.View>
-        <Animated.View style={[fill, origin(100, 206), { transform: [{ scaleX: breatheX }, { scaleY: breatheY }] }]}><Body size={size} /></Animated.View>
-        <Animated.View style={[fill, { transform: [step(0)] }]}><Paw size={size} side="l" /></Animated.View>
-        <Animated.View style={[fill, { transform: [step(0.5)] }]}><Paw size={size} side="r" /></Animated.View>
-        <Collar size={size} />
+        <Animated.View style={[fill, origin(100, 206), { transform: [{ scaleX: breatheX }, { scaleY: breatheY }] }]}><Body size={size} outfit={outfit} /></Animated.View>
+        <Animated.View style={[fill, { transform: [step(0)] }]}><Paw size={size} side="l" outfit={outfit} /></Animated.View>
+        <Animated.View style={[fill, { transform: [step(0.5)] }]}><Paw size={size} side="r" outfit={outfit} /></Animated.View>
+        <Collar size={size} outfit={outfit} />
         <Animated.View style={[fill, origin(100, 132), {
           transform: [{ rotate: v.look.interpolate({ inputRange: [-1, 0, 1], outputRange: ["-6deg", "0deg", "6deg"] }) }],
         }]}>
           <Animated.View style={[fill, { transform: [{ translateX: earsX }] }]}>
             <Animated.View style={[fill, origin(56, 40), { transform: [{ rotate: v.ear.interpolate({ inputRange: [-1, 1], outputRange: ["-9deg", "9deg"] }) }] }]}>
               <Ear size={size} side="l" />
+              {outfit.bow && <Bow size={size} color={outfit.bow} />}
             </Animated.View>
             <Animated.View style={[fill, origin(144, 40), { transform: [{ rotate: v.ear.interpolate({ inputRange: [-1, 1], outputRange: ["9deg", "-9deg"] }) }] }]}>
               <Ear size={size} side="r" />
             </Animated.View>
           </Animated.View>
           <Head size={size} />
+          {crown ? <Crown size={size} /> : outfit.hat && <Hat size={size} kind={outfit.hat} />}
           <Animated.View style={[fill, { transform: [{ translateX: faceX }] }]}>
             {expression === "happy" || expression === "sleepy" || mode === "sleep"
               ? <ClosedEyes size={size} kind={expression === "happy" ? "happy" : "sleepy"} />
               : <Animated.View style={[fill, origin(100, 80), { transform: [{ scaleY: v.blink }] }]}><Eyes size={size} /></Animated.View>}
             {expression === "happy" && <Blush size={size} />}
             <Muzzle size={size} mouth={mode === "sleep" ? "smile" : mouth} />
+            {outfit.glasses && <Glasses size={size} />}
           </Animated.View>
         </Animated.View>
       </Animated.View>
       {mode === "sleep" && lively && <Snore size={size} />}
       <Hearts burst={hearts} size={size} />
+      {badge && mode !== "sleep" && <Badge size={size} lively={lively} />}
     </Pressable>
+    </View>
+  );
+}
+
+/** "💡" at the top corner, pulsing gently: tap me, there's something to discover. */
+function Badge({ size, lively }: { size: number; lively: boolean }) {
+  const t = useRef(new Animated.Value(0)).current;
+  useLoop(lively, () => Animated.loop(Animated.sequence([timing(t, 1, 700), timing(t, 0, 700), Animated.delay(900)])), []);
+  const d = size * 0.3;
+  return (
+    <Animated.View pointerEvents="none" style={{
+      position: "absolute", right: -size * 0.04, top: size * 0.02, width: d, height: d, borderRadius: d / 2, backgroundColor: "#FFF4C2",
+      borderWidth: 1.5, borderColor: "#F5C542", alignItems: "center", justifyContent: "center",
+      transform: [{ scale: t.interpolate({ inputRange: [0, 1], outputRange: [1, 1.15] }) }],
+    }}>
+      <Text style={{ fontSize: d * 0.55 }}>💡</Text>
+    </Animated.View>
   );
 }
 

@@ -359,3 +359,19 @@ export const nextLateAt = (p: Plan, after: number) => nextMatching(p, after, (d)
   const t = lateTime(p, d);
   return t === null ? [] : [t];
 });
+
+/**
+ * Pills taken in a row (pill), or patch / ring / injection actions done on their scheduled day in a row, counting back
+ * from today. Today counts once it's done; while it's still open it doesn't break the streak. Starts at the setup.
+ */
+export function streak(p: Plan, today: string): number {
+  const pill = methodOf(p) === "pill";
+  let n = 0;
+  for (let i = 0, day = today; i < 800 && day >= p.trackingSince; i++, day = addDays(day, -1)) {
+    if (!actionOn(p, day)) continue;
+    const done = pill ? day in p.takenDays : doneAt(p, day)?.day === day;
+    if (done) n++;
+    else if (day !== today) break;
+  }
+  return n;
+}

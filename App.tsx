@@ -12,7 +12,7 @@ import {
   AlertTriangle, AtSign, BellRing, CalendarDays, CalendarHeart, Check, CheckCheck, Clock3, Copy, Eye, EyeOff, KeyRound, LockKeyhole, MailWarning, Moon, Pencil, Pill, Plus, SkipForward, SlidersHorizontal, Tag,
   UserMinus, UserPlus, UserRound, type LucideIcon,
 } from "lucide-react-native";
-import { actionOn, addDays, clock, cycleLength, dayKey, diffDays, doneOn, firstEditableDay, isTaken, methodOf, openActionDay, slot, trackFromPackStart, zonedTime } from "./shared/schedule";
+import { actionOn, addDays, clock, cycleLength, dayKey, diffDays, doneOn, firstEditableDay, isTaken, methodOf, openActionDay, slot, streak, trackFromPackStart, zonedTime } from "./shared/schedule";
 import { auth } from "./src/firebase";
 import { AccountScreen } from "./src/AccountScreen";
 import { setAuthLanguage, resendVerification, takePendingPassword } from "./src/auth";
@@ -36,6 +36,7 @@ import { loadMascot } from "./src/mascot/store";
 import { MascotProvider, MascotSpot, useMascotScroll } from "./src/mascot/world";
 import { PasswordForm, ScheduleWizard, SubscribeForm } from "./src/Forms";
 import { ExportScreen } from "./src/ExportScreen";
+import { FactBook } from "./src/mascot/FactBook";
 import { HistoryScreen } from "./src/HistoryScreen";
 import { formatDay, loadSavedLang, strings, useI18n, type Lang, type Strings } from "./src/i18n";
 import { missedDays, packCells } from "./src/pack";
@@ -46,7 +47,7 @@ import { C, F, fonts, G, loadAppearance, R, setSystemDark, shadow, themedStyles,
 import { errorText, queued } from "./src/errors";
 import { Badge, Button, Card, Field, IconButton, LanguageSwitch, LinkButton, ProgressRing, s, SectionTitle } from "./src/ui";
 
-type Screen = "home" | "password" | "subscribe" | "schedule" | "account" | "history" | "export";
+type Screen = "home" | "password" | "subscribe" | "schedule" | "account" | "history" | "export" | "factbook";
 type Followed = Profile | "denied" | undefined;
 
 /**
@@ -373,6 +374,8 @@ function Main({ user }: { user: User }) {
   const username = own?.username ?? account.pid;
   const historyProfile = historyOf === account.pid ? own : historyOf ? followed[historyOf] : null;
   const historySchedule = historyProfile && historyProfile !== "denied" && hasSchedule(historyProfile) ? historyProfile : null;
+  // Pills (or on-time patch / ring / injection actions) in a row, for Nyxi's celebrations.
+  const streakNow = schedule ? { count: streak(schedule, todayOf(schedule)), unit: methodOf(schedule) === "pill" ? "pill" as const : "action" as const } : null;
 
   // The kitten on the home screen: today's pill (read when it checks, since "overdue" starts with time) and today's note.
   const methodNow = schedule && methodOf(schedule) !== "pill" ? methodStatus(schedule, todayOf(schedule), Date.now(), t, lang) : null;
@@ -398,8 +401,10 @@ function Main({ user }: { user: User }) {
     <Animated.ScrollView key={`${screen}-${themeVersion}`} ref={mascotScroll.ref} contentContainerStyle={scrollContent} keyboardShouldPersistTaps="handled"
       onScroll={mascotScroll.onScroll} scrollEventThrottle={16} onLayout={mascotScroll.onLayout}>
       {screen === "account" && <AccountScreen user={user} account={account} pushToken={pushToken} onBack={home} onUpdateFound={setRelease}
-        followerOnly={schedule ? null : followerOnly} onFollowerOnly={changeFollowerOnly} onExport={() => setScreen("export")} />}
+        followerOnly={schedule ? null : followerOnly} onFollowerOnly={changeFollowerOnly} onExport={() => setScreen("export")}
+        onFactBook={() => setScreen("factbook")} />}
       {screen === "export" && <ExportScreen schedule={schedule} notes={ownNotes} name={username} onBack={home} />}
+      {screen === "factbook" && <FactBook onBack={home} />}
       {screen === "password" && <PasswordForm uid={uid} pid={account.pid} name={username} hasPassword={sharing.set} onSaved={(password) => { setSharing({ set: true, password }); home(); }} onBack={home} />}
       {screen === "subscribe" && <SubscribeForm uid={uid} ownPid={account.pid} onBack={home} />}
       {screen === "schedule" && <ScheduleWizard uid={uid} pid={account.pid} current={own} width={width} onBack={home} />}
@@ -412,7 +417,8 @@ function Main({ user }: { user: User }) {
       )}
       {screen === "home" && <MascotProvider scroll={mascotScroll} day={today} getPill={todayPill}
         takenToday={methodNow ? (methodNow.doneToday ? true : methodNow.open ? false : null) : schedule && pillDay ? isTaken(schedule, todayOf(schedule)) : null}
-        hasNoteToday={schedule ? !!ownNotes[todayOf(schedule)] : null}
+        hasNoteToday={!!ownNotes[schedule ? todayOf(schedule) : today]}
+        streak={streakNow} onOpenFactBook={() => setScreen("factbook")}
         name={own?.username && own.username !== account.pid ? own.username : null}
         onTakePill={() => schedule && editDay(schedule, openActionDay(schedule, todayOf(schedule)) ?? todayOf(schedule))} onFocusNote={() => setNoteFocus((n) => n + 1)}>
         <View style={st.topBar}>

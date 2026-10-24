@@ -12,20 +12,31 @@ import {
 } from "react-native";
 import { useI18n, type Lang, type Strings } from "../i18n";
 import { useSheetOpen } from "../sheets";
-import { ART_H, ART_W, type Expression } from "./art";
-import { idleAction, nextMessage, offersFact, pickFact, rememberFact, SNOOZE, type PillState } from "./brain";
+import { ART_H, ART_W, OUTFITS, type Expression } from "./art";
+import {
+  idleAction, nextMessage, pickFact, pickMilestone, pickMyth, rememberAnswer, rememberFact, rememberMilestone, SNOOZE, type PillState,
+  type STREAK_MILESTONES,
+} from "./brain";
 import { Bubble, TypingDots, type BubbleContent } from "./Bubble";
+import { nyxiAge, specialDay } from "./calendar";
 import { FACTS } from "./facts";
+import { HERSTORY } from "./herstory";
 import { Kitten, type Mode } from "./Kitten";
-import { memoryFor, updateMemory, useMascotSettings } from "./store";
+import { MYTHS } from "./myths";
+import { memoryFor, onNoteSaved, updateMemory, useMascotSettings } from "./store";
 
 const nativeDriver = Platform.OS !== "web";
-const KW = 64;
+const KW = 90; // 40 % bigger than the first version (64)
+/** Movement scales with the kitten: a calmer pace in pixels per millisecond for the bigger body. */
+const WALK_MS_PER_PX = 5;
+const CLIMB_MS_PER_PX = 3;
 const KH = (KW * ART_H) / ART_W;
 const SEAT_PAD = 6;
 /** Room height a typical bubble needs (a fact with buttons). */
 const BUBBLE_ROOM = 170;
 const TOPICS = FACTS.map((f) => f.topic);
+const factByTag = (tag: string) => FACTS.find((f) => f.tag === tag)!;
+const MYTH_TAGS = MYTHS.map((m) => m.tag);
 /** Room height that fits the kitten above a block whose own top margin is `inset`. */
 const baseRoom = (inset: number) => KH - inset + 6;
 
@@ -90,13 +101,16 @@ type Props = {
   name: string | null;
   onTakePill: () => void;
   onFocusNote: () => void;
+  /** Pills (or on-time actions) in a row, for the streak celebrations; null without an own schedule. */
+  streak: { count: number; unit: keyof typeof STREAK_MILESTONES } | null;
+  onOpenFactBook: () => void;
   children: React.ReactNode;
 };
 
 export function MascotProvider(props: Props) {
   const settings = useMascotSettings();
   if (!settings.enabled) return <>{props.children}</>;
-  return <WithoutKittenOnError fallback={props.children}><World {...props} factsEnabled={settings.facts} /></WithoutKittenOnError>;
+  return <WithoutKittenOnError fallback={props.children}><World {...props} factsEnabled={settings.facts} outfits={settings.outfits} /></WithoutKittenOnError>;
 }
 
 /** If the kitten ever fails to render, the home screen carries on without it. */
@@ -123,7 +137,9 @@ function line(plain: (t: Strings) => readonly string[], named: (t: Strings) => r
 const run = (anim: Animated.CompositeAnimation) => new Promise<boolean>((resolve) => anim.start(({ finished }) => resolve(finished)));
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function World({ scroll, day, getPill, takenToday, hasNoteToday, name, onTakePill, onFocusNote, factsEnabled, children }: Props & { factsEnabled: boolean }) {
+function World({
+  scroll, day, getPill, takenToday, hasNoteToday, name, onTakePill, onFocusNote, streak, onOpenFactBook, factsEnabled, outfits, children,
+}: Props & { factsEnabled: boolean; outfits: boolean }) {
   const { t, lang } = useI18n();
   const sheetOpen = useSheetOpen();
 
@@ -301,7 +317,7 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, name, onTakePil
       arrive();
       setMode("walk");
       setFacing(target.x > start.x ? 1 : -1);
-      await moveTo(target, Math.max(250, Math.abs(target.x - start.x) * 4), Easing.linear);
+      await moveTo(target, Math.max(320, Math.abs(target.x - start.x) * WALK_MS_PER_PX), Easing.inOut(Easing.sin));
     } else if (Math.abs(target.y - start.y) < 240 && !roamingClinging()) {
       arrive();
       setFacing(target.x > start.x ? 1 : target.x < start.x ? -1 : 0);
@@ -311,16 +327,16 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, name, onTakePil
       const edge = edgeX(edgeSide);
       setMode("walk");
       setFacing(edgeSide === "right" ? 1 : -1);
-      if (Math.abs(start.x - edge) > 4) await moveTo({ x: edge, y: start.y }, Math.max(200, Math.abs(start.x - edge) * 3.5), Easing.linear);
+      if (Math.abs(start.x - edge) > 4) await moveTo({ x: edge, y: start.y }, Math.max(260, Math.abs(start.x - edge) * WALK_MS_PER_PX), Easing.inOut(Easing.sin));
       if (trip !== travel.current) return;
       setMode("climb");
       setFacing(0);
-      await moveTo({ x: edge, y: target.y }, Math.min(1400, Math.max(300, Math.abs(target.y - start.y) * 2.6)));
+      await moveTo({ x: edge, y: target.y }, Math.min(1700, Math.max(360, Math.abs(target.y - start.y) * CLIMB_MS_PER_PX)));
       if (trip !== travel.current) return;
       arrive();
       setMode("walk");
       setFacing(edgeSide === "right" ? -1 : 1);
-      await moveTo(target, Math.max(250, Math.abs(target.x - edge) * 3.5), Easing.linear);
+      await moveTo(target, Math.max(320, Math.abs(target.x - edge) * WALK_MS_PER_PX), Easing.inOut(Easing.sin));
     }
     if (trip !== travel.current) return;
     if (!frames.get(id)) return lost();
@@ -339,15 +355,15 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, name, onTakePil
 
   const hop = async (target: { x: number; y: number }) => {
     const start = posNow.current;
-    const peak = Math.min(start.y, target.y) - 46;
-    await run(Animated.timing(squash, { toValue: 0.86, duration: 120, useNativeDriver: nativeDriver }));
+    const peak = Math.min(start.y, target.y) - KH * 0.55;
+    await run(Animated.timing(squash, { toValue: 0.82, duration: 160, easing: Easing.out(Easing.quad), useNativeDriver: nativeDriver })); // crouch
     posNow.current = target;
     squash.setValue(1.08);
     await run(Animated.parallel([
-      Animated.timing(pos.x, { toValue: target.x, duration: 560, easing: Easing.linear, useNativeDriver: nativeDriver }),
+      Animated.timing(pos.x, { toValue: target.x, duration: 640, easing: Easing.linear, useNativeDriver: nativeDriver }),
       Animated.sequence([
-        Animated.timing(pos.y, { toValue: peak, duration: 260, easing: Easing.out(Easing.quad), useNativeDriver: nativeDriver }),
-        Animated.timing(pos.y, { toValue: target.y, duration: 300, easing: Easing.in(Easing.quad), useNativeDriver: nativeDriver }),
+        Animated.timing(pos.y, { toValue: peak, duration: 300, easing: Easing.out(Easing.quad), useNativeDriver: nativeDriver }),
+        Animated.timing(pos.y, { toValue: target.y, duration: 340, easing: Easing.in(Easing.quad), useNativeDriver: nativeDriver }),
       ]),
     ]));
     squash.setValue(0.84);
@@ -442,9 +458,7 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, name, onTakePil
   };
   const quiet = () => setMessage(null);
 
-  // Facts offered on a tap: after a "no" (or "Thanks" instead of another one), Nyxi asks again every few taps.
-  const tapsSinceDecline = useRef<number | null>(null);
-  const declined = () => { tapsSinceDecline.current = 0; quiet(); };
+  const declined = quiet;
 
   const showFact = () => {
     const index = pickFact(TOPICS, memoryFor(day));
@@ -458,6 +472,92 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, name, onTakePil
       buttons: [{ label: t.mascotFactMore, onPress: showFact }, { label: t.mascotFactThanks, primary: true, onPress: declined }],
     }));
   };
+
+  const cheer = (ms = 1300) => {
+    setHearts((h) => h + 1);
+    setExpression("happy");
+    setTimeout(() => setExpression("normal"), ms);
+  };
+
+  // The tap menu: what Nyxi can do, right there.
+  const showMenu = () => {
+    const purr = line((t) => t.mascotPurr, (t) => t.mascotPurrNamed, name);
+    say("menu", (t) => ({
+      text: `${purr(t)} ${t.mascotMenu}`,
+      buttons: [
+        { label: t.mascotMenuFact, primary: true, onPress: showFact },
+        { label: t.mascotMenuQuiz, onPress: showQuiz },
+        { label: t.mascotMenuHerstory, onPress: showHerstory },
+        { label: t.mascotMenuPet, onPress: petMe },
+        { label: t.mascotMenuBook, onPress: () => { quiet(); onOpenFactBook(); } },
+      ],
+    }));
+  };
+
+  /** "Myth or fact?": a statement, then the answer with the deciding fact and its source. */
+  const showQuiz = () => {
+    const tag = pickMyth(MYTH_TAGS, memoryFor(day));
+    const myth = MYTHS.find((m) => m.tag === tag)!;
+    console.info(`[Nyxi] myth "${tag}" (src/mascot/myths.ts)`);
+    const answer = (guess: "myth" | "fact") => {
+      const right = guess === myth.answer;
+      updateMemory(day, (mem) => rememberAnswer(mem, tag, right, MYTHS.length));
+      const n = memoryFor(day).quizStreak ?? 0;
+      if (right) cheer(1800);
+      const verdict = right ? line((t) => t.mascotQuizRight, (t) => t.mascotQuizRight.map((x) => () => x), null) : line((t) => t.mascotQuizWrong, (t) => t.mascotQuizWrong.map((x) => () => x), null);
+      const fact = factByTag(tag);
+      say("quizAnswer", (t, lang) => ({
+        title: `${verdict(t)} ${t.mascotQuizIs({ myth: myth.answer === "myth" })}`,
+        text: `${fact[lang]}${right && n >= 3 ? ` ${t.mascotQuizStreak({ n })}` : ""}`,
+        source: { name: fact.source, url: fact.url, label: t.mascotSource },
+        buttons: [{ label: t.mascotQuizNext, onPress: showQuiz }, { label: t.mascotFactThanks, primary: true, onPress: quiet }],
+      }));
+    };
+    say("quiz", (t, lang) => ({
+      title: t.mascotQuizTitle, text: lang === "de" ? `„${myth.de}“` : `“${myth.en}”`,
+      buttons: [{ label: t.mascotMyth, primary: true, onPress: () => answer("myth") }, { label: t.mascotFact, primary: true, onPress: () => answer("fact") }],
+    }));
+  };
+
+  /** A milestone in women's history; one that happened on today's date first. */
+  const showHerstory = () => {
+    const monthDay = day.slice(5);
+    const tag = pickMilestone(HERSTORY, monthDay, memoryFor(day));
+    const item = HERSTORY.find((h) => h.tag === tag)!;
+    console.info(`[Nyxi] herstory "${tag}" (src/mascot/herstory.ts)`);
+    updateMemory(day, (mem) => rememberMilestone(mem, tag, HERSTORY.length));
+    say("herstory", (t, lang) => ({
+      title: item.date === monthDay ? t.mascotOnThisDay : t.mascotHerstoryTitle, text: item[lang],
+      source: { name: item.source, url: item.url, label: t.mascotSource },
+      buttons: [{ label: t.mascotFactMore, onPress: showHerstory }, { label: t.mascotFactThanks, primary: true, onPress: quiet }],
+    }));
+  };
+
+  const petMe = () => {
+    lastInteraction.current = Date.now();
+    cheer();
+    const purr = line((t) => t.mascotPurr, (t) => t.mascotPurrNamed, name);
+    say("purr", (t) => ({ text: purr(t) }), 2000);
+  };
+
+  // Reacting to a saved note: happy with a happy mood, gentle with a sad one.
+  useEffect(() => onNoteSaved((mood) => {
+    if (hiddenToday) return;
+    const happy = mood === "😄" || mood === "🙂";
+    const sad = mood === "😕" || mood === "😣";
+    if (happy) cheer(2200);
+    const pool = (t: Strings) => (happy ? t.mascotNoteHappy : sad ? t.mascotNoteSad : t.mascotNoteOkay);
+    const text = line(pool, (t) => pool(t).map((x) => () => x), null);
+    setTimeout(() => say("note", (t) => ({ text: text(t) }), 3200), 600);
+  }), [hiddenToday]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Today's outfit (special days, if switched on); remembered for the wardrobe.
+  const special = outfits ? specialDay(day) : null;
+  const crown = memoryFor(day).crownDay === day;
+  useEffect(() => {
+    const id = special?.id ?? "everyday";
+    if (!memoryFor(day).outfits?.includes(id)) updateMemory(day, (m) => ({ ...m, outfits: [...(m.outfits ?? []), id] }));
+  }, [special?.id, day]);
 
   /** Runs `then` once a scroll we started has come to rest (no scroll events for a moment). */
   const scrollEnd = useRef<{ timer: ReturnType<typeof setTimeout> | null; then: () => void } | null>(null);
@@ -486,7 +586,10 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, name, onTakePil
       if (!s || busy.current || messageRef.current || sheetOpen || keyboard || programmaticScroll.current) return;
       const m = memoryFor(day);
       const now = Date.now();
-      const due = nextMessage({ now, hour: new Date().getHours(), openedFor: now - openedAt.current, pill: getPill(), hasNoteToday, factsEnabled }, m);
+      const due = nextMessage({
+        now, hour: new Date().getHours(), openedFor: now - openedAt.current, pill: getPill(), hasNoteToday, factsEnabled,
+        special: special?.id ?? null, year: Number(day.slice(0, 4)), streak: streak ?? undefined,
+      }, m);
       if (!due) return;
       if (!seatFits(s, BUBBLE_ROOM)) { // move somewhere the bubble fits on screen first; speak on a later tick
         const id = chooseSpot(s.spot, BUBBLE_ROOM);
@@ -516,6 +619,26 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, name, onTakePil
         say("goodnight", (t) => ({ text: text(t) }), 3800);
         setExpression("sleepy");
         setTimeout(() => setExpression("normal"), 3800);
+      } else if (due.kind === "special") {
+        const sp = specialDay(day)!;
+        // Counts as today's fact, so no automatic one follows.
+        updateMemory(day, (mem) => ({ ...mem, greeted: true, autoFact: mem.autoFact || !!sp.item, special: { ...mem.special, [sp.id]: Number(day.slice(0, 4)) } }));
+        const fact = sp.item?.kind === "fact" ? factByTag(sp.item.tag) : null;
+        const milestone = sp.item?.kind === "herstory" ? HERSTORY.find((h) => h.tag === sp.item!.tag)! : null;
+        if (milestone) updateMemory(day, (mem) => rememberMilestone(mem, milestone.tag, HERSTORY.length));
+        if (fact) updateMemory(day, (mem) => ({ ...mem, found: mem.found?.includes(FACTS.indexOf(fact)) ? mem.found : [...(mem.found ?? []), FACTS.indexOf(fact)] }));
+        cheer(2400);
+        const item = fact ?? milestone;
+        say("special", (t, lang) => ({
+          title: sp.id === "birthday" ? t.mascotBirthday({ age: nyxiAge(day) }) : t.mascotSpecial[sp.id],
+          text: item ? item[lang] : "",
+          ...(item ? { source: { name: item.source, url: item.url, label: t.mascotSource } } : {}),
+          buttons: [{ label: t.mascotFactThanks, primary: true, onPress: quiet }],
+        }), 11_000); // closes by itself so it never holds up a reminder or the mood question (it's in the fact book)
+      } else if (due.kind === "streak") {
+        updateMemory(day, (mem) => ({ ...mem, streakSeen: due.days, crownDay: day }));
+        cheer(3000);
+        say("streak", (t) => ({ text: t.mascotStreak({ n: due.days, pill: streak?.unit === "pill" }) }), 5000);
       } else if (due.kind === "mood") {
         updateMemory(day, (mem) => ({ ...mem, moodAsked: true }));
         say("mood", (t) => ({ text: t.mascotMood, buttons: [{ label: t.mascotMoodYes, primary: true, onPress: openNotes }, { label: t.mascotMoodNo, onPress: quiet }] }));
@@ -566,7 +689,7 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, name, onTakePil
           const x = side === "left" ? SEAT_PAD : f.width - KW - SEAT_PAD;
           setMode("walk");
           setFacing(x > s.x ? 1 : -1);
-          await run(Animated.timing(roomX, { toValue: x, duration: Math.abs(x - s.x) * 9, easing: Easing.linear, useNativeDriver: nativeDriver }));
+          await run(Animated.timing(roomX, { toValue: x, duration: Math.abs(x - s.x) * 10, easing: Easing.inOut(Easing.sin), useNativeDriver: nativeDriver }));
           if (seatRef.current?.spot === s.spot) { setSeat({ spot: s.spot, x, side }); setMode("sit"); setFacing(0); }
         }
       } else if (action === "peek") {
@@ -599,21 +722,13 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, name, onTakePil
       setTimeout(() => setExpression("normal"), 800);
       return;
     }
-    setHearts((h) => h + 1);
-    setExpression("happy");
-    setTimeout(() => setExpression("normal"), 1300);
-    if (messageRef.current && messageRef.current.kind !== "purr") return; // a purr doesn't keep the next tap from counting
-    if (tapsSinceDecline.current !== null) tapsSinceDecline.current++;
-    const purr = line((t) => t.mascotPurr, (t) => t.mascotPurrNamed, name);
-    if (factsEnabled && offersFact(tapsSinceDecline.current)) {
-      tapsSinceDecline.current = null;
-      say("offer", (t) => ({
-        text: `${purr(t)} ${t.mascotOfferFact}`,
-        buttons: [{ label: t.mascotYes, primary: true, onPress: showFact }, { label: t.mascotNo, onPress: declined }],
-      }));
-    } else {
-      say("purr", (t) => ({ text: purr(t) }), 1800);
-    }
+    if (!memoryFor(day).tapped) updateMemory(day, (m) => ({ ...m, tapped: true }));
+    cheer();
+    // A tap opens the menu; tapping again while it's open is a pat on the head.
+    // Important questions (a reminder, the mood, a quiz waiting for an answer, hiding) stay until answered.
+    const kind = messageRef.current?.kind;
+    if (kind === "menu") petMe();
+    else if (kind !== "reminder" && kind !== "mood" && kind !== "quiz" && kind !== "hide") showMenu();
   };
   const askHide = () => {
     lastInteraction.current = Date.now();
@@ -646,7 +761,8 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, name, onTakePil
 
   const kitten = (
     <Kitten size={KW} mode={mode} facing={facing} expression={expression} talking={talking} hearts={hearts}
-      active={active} reduceMotion={reduceMotion} label={t.mascotLabel} onPress={pet} onLongPress={askHide} />
+      active={active} reduceMotion={reduceMotion} label={t.mascotLabel} onPress={pet} onLongPress={askHide} onStroke={petMe}
+      outfit={OUTFITS[special?.id ?? "everyday"]} crown={crown} badge={!memoryFor(day).tapped || (factsEnabled && !memoryFor(day).autoFact)} />
   );
   const squashStyle = { transformOrigin: "50% 100%", transform: [{ scaleY: squash }, { scaleX: squash.interpolate({ inputRange: [0.8, 1, 1.2], outputRange: [1.12, 1, 0.92] }) }] };
 
@@ -670,7 +786,7 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, name, onTakePil
         </>
       );
     },
-  }), [seat, mode, facing, expression, talking, hearts, active, reduceMotion, message, showBubble, lang]); // eslint-disable-line react-hooks/exhaustive-deps
+  }), [seat, mode, facing, expression, talking, hearts, active, reduceMotion, message, showBubble, lang, special?.id, crown]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // On a layer: clamped to the visible part of the page (computed natively while scrolling).
   const layerY = useMemo(() => {

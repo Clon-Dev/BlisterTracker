@@ -20,7 +20,7 @@ These are general facts, not personal medical advice.
 - `cycle-hormones`: In the first half of the cycle oestrogen rises and an egg matures. After ovulation, progesterone prepares the womb lining. ([NHS](https://www.nhs.uk/conditions/periods/fertility-in-the-menstrual-cycle/))
 - `tampon-lost`: A tampon can't get lost inside you. ([NHS](https://www.nhs.uk/conditions/periods/))
 - `menstrual-cup`: Menstrual cups collect blood instead of absorbing it. They're made of silicone and can be washed and reused. ([NHS](https://www.nhs.uk/conditions/periods/))
-- `toxic-shock`: Toxic shock syndrome is rare. Wash your hands and don't leave tampons or cups in longer than recommended. ([NHS](https://www.nhs.uk/conditions/toxic-shock-syndrome/))
+- `toxic-shock`: Wash your hands and don't leave tampons or cups in longer than recommended. It increase the chance of the rare Toxic Shock Syndrome. ([NHS](https://www.nhs.uk/conditions/toxic-shock-syndrome/))
 - `bleeding-check`: Bleeding between periods, after sex or after the menopause should always be checked by a doctor. ([NHS](https://www.nhs.uk/conditions/periods/))
 - `missed-periods`: Missed 3 periods in a row and the pregnancy test is negative? That's worth a doctor's visit. ([NHS](https://www.nhs.uk/conditions/periods/))
 

@@ -3,11 +3,11 @@ import { useSyncExternalStore } from "react";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { forDay, freshMemory, type Memory } from "./brain";
 
-export type MascotSettings = { enabled: boolean; facts: boolean };
+export type MascotSettings = { enabled: boolean; facts: boolean; /** Outfits on special days. */ outfits: boolean };
 type State = { settings: MascotSettings; memory: Memory };
 
 const KEY = "mascot";
-let state: State = { settings: { enabled: true, facts: true }, memory: freshMemory("") };
+let state: State = { settings: { enabled: true, facts: true, outfits: true }, memory: freshMemory("") };
 const listeners = new Set<() => void>();
 
 function set(next: State) {
@@ -35,3 +35,13 @@ export const setMascotSettings = (patch: Partial<MascotSettings>) => set({ ...st
 /** The memory for `day` (daily counters reset on a new day). */
 export const memoryFor = (day: string) => forDay(state.memory, day);
 export const updateMemory = (day: string, change: (m: Memory) => Memory) => set({ ...state, memory: change(forDay(state.memory, day)) });
+
+/** The whole memory (the fact book reads what was discovered). */
+export const useMascotMemory = () => useSyncExternalStore(subscribe, getMemory, getMemory);
+const getMemory = () => state.memory;
+
+// A note was saved (with this mood): Nyxi reacts on the home screen.
+type NoteListener = (mood: string | null) => void;
+const noteListeners = new Set<NoteListener>();
+export const onNoteSaved = (l: NoteListener) => { noteListeners.add(l); return () => { noteListeners.delete(l); }; };
+export const noteSaved = (mood: string | null) => noteListeners.forEach((l) => l(mood));
