@@ -35,6 +35,7 @@ import type { PillState } from "./src/mascot/brain";
 import { loadMascot } from "./src/mascot/store";
 import { MascotProvider, MascotSpot, useMascotScroll } from "./src/mascot/world";
 import { PasswordForm, ScheduleWizard, SubscribeForm } from "./src/Forms";
+import { ExportScreen } from "./src/ExportScreen";
 import { HistoryScreen } from "./src/HistoryScreen";
 import { formatDay, loadSavedLang, strings, useI18n, type Lang, type Strings } from "./src/i18n";
 import { missedDays, packCells } from "./src/pack";
@@ -45,7 +46,7 @@ import { C, F, fonts, G, loadAppearance, R, setSystemDark, shadow, themedStyles,
 import { errorText, queued } from "./src/errors";
 import { Badge, Button, Card, Field, IconButton, LanguageSwitch, LinkButton, ProgressRing, s, SectionTitle } from "./src/ui";
 
-type Screen = "home" | "password" | "subscribe" | "schedule" | "account" | "history";
+type Screen = "home" | "password" | "subscribe" | "schedule" | "account" | "history" | "export";
 type Followed = Profile | "denied" | undefined;
 
 /**
@@ -397,15 +398,17 @@ function Main({ user }: { user: User }) {
     <Animated.ScrollView key={`${screen}-${themeVersion}`} ref={mascotScroll.ref} contentContainerStyle={scrollContent} keyboardShouldPersistTaps="handled"
       onScroll={mascotScroll.onScroll} scrollEventThrottle={16} onLayout={mascotScroll.onLayout}>
       {screen === "account" && <AccountScreen user={user} account={account} pushToken={pushToken} onBack={home} onUpdateFound={setRelease}
-        followerOnly={schedule ? null : followerOnly} onFollowerOnly={changeFollowerOnly} />}
+        followerOnly={schedule ? null : followerOnly} onFollowerOnly={changeFollowerOnly} onExport={() => setScreen("export")} />}
+      {screen === "export" && <ExportScreen schedule={schedule} notes={ownNotes} name={username} onBack={home} />}
       {screen === "password" && <PasswordForm uid={uid} pid={account.pid} name={username} hasPassword={sharing.set} onSaved={(password) => { setSharing({ set: true, password }); home(); }} onBack={home} />}
       {screen === "subscribe" && <SubscribeForm uid={uid} ownPid={account.pid} onBack={home} />}
       {screen === "schedule" && <ScheduleWizard uid={uid} pid={account.pid} current={own} width={width} onBack={home} />}
-      {screen === "history" && historySchedule && (
-        <HistoryScreen schedule={historySchedule} onBack={home}
+      {screen === "history" && (historySchedule || (historyProfile && historyProfile !== "denied")) && (
+        <HistoryScreen schedule={historySchedule} onBack={home} title={historyProfile && historyProfile !== "denied" ? historyProfile.username : undefined}
+          onExport={historyOf === account.pid ? () => setScreen("export") : undefined}
           notes={historyOf === account.pid ? ownNotes : followedNotes[historyOf!] ?? {}}
           owner={historyOf === account.pid ? { uid, pid: account.pid } : undefined}
-          onEditDay={historyOf === account.pid ? (day) => editDay(historySchedule, day) : undefined} />
+          onEditDay={historyOf === account.pid && historySchedule ? (day) => editDay(historySchedule, day) : undefined} />
       )}
       {screen === "home" && <MascotProvider scroll={mascotScroll} day={today} getPill={todayPill}
         takenToday={methodNow ? (methodNow.doneToday ? true : methodNow.open ? false : null) : schedule && pillDay ? isTaken(schedule, todayOf(schedule)) : null}
@@ -426,9 +429,6 @@ function Main({ user }: { user: User }) {
         {!emailVerified && (
           <Notice icon={MailWarning} tone="warning" text={t.verifyBanner({ email: user.email ?? "" })}
             action={t.verifyResend} onAction={() => resendVerification(user).then(() => toast(t.verifySent), (e) => alert(t.errorTitle, errorText(e)))} />
-        )}
-        {sharing.set && sharing.password === null && (
-          <Notice icon={KeyRound} tone="warning" text={t.sharingAgainNotice} action={t.setItAgain} onAction={() => setScreen("password")} />
         )}
         {push && push !== "granted" && (
           <Notice icon={BellRing} tone="primary"
@@ -462,6 +462,12 @@ function Main({ user }: { user: User }) {
               after={<MascotSpot id="supplies"><SuppliesCard pid={account.pid} schedule={schedule} /></MascotSpot>} />
           : !followerOnly && <MascotSpot id="setup"><SetupCard t={t} onCreate={() => setScreen("schedule")}
             onFollowerOnly={() => { changeFollowerOnly(true); toast(t.followerOnlyToast); }} /></MascotSpot>}
+
+        {/* Without an own plan: daily notes all the same (followers can read the shared ones). */}
+        {!schedule && <>
+          <MascotSpot id="note"><NoteCard uid={uid} pid={account.pid} day={today} note={ownNotes[today] ?? null} focusKey={noteFocus} /></MascotSpot>
+          <LinkButton title={t.notesHistory} icon={CalendarDays} onPress={() => showHistory(account.pid)} />
+        </>}
 
         <MascotSpot id="id"><IdCard username={username} sharing={sharing} followers={subscriberCount} t={t} onPassword={() => setScreen("password")}
           onEditUsername={() => openSheet<void>((done) => <UsernameSheet uid={uid} pid={account.pid} current={username} t={t} done={done} />)} /></MascotSpot>
@@ -769,12 +775,15 @@ function FollowedSchedule({ pid, profile, notes, today, width, t, onHistory, onR
   canRead: boolean; onUnlock: (name: string) => void;
 }) {
   const { lang } = useI18n();
-  const sch = profile && profile !== "denied" && hasSchedule(profile) ? profile : null;
-  const todaysNote = sch ? notes[todayOf(sch)] : undefined;
+  const known = profile && profile !== "denied" ? profile : null;
+  const sch = known && hasSchedule(known) ? known : null;
+  // Without a plan (notes only), "today" is this device's day.
+  const todaysNote = known ? notes[sch ? todayOf(sch) : today] : undefined;
   const someLocked = Object.values(notes).some((n) => n.locked);
   // The key can be fetched once the owner has published it; until then there is nothing to enter.
-  const canUnlock = !!sch?.shareKeyWrap && (!canRead || someLocked);
-  const waiting = !!sch && !sch.shareKeyWrap && someLocked;
+  const canUnlock = !!known?.shareKeyWrap && (!canRead || someLocked);
+  const waiting = !!known && !known.shareKeyWrap && someLocked;
+  const hasNotes = Object.keys(notes).length > 0;
   const handle = (profile && profile !== "denied" && profile.username) || pid;
   const name = sch?.name || handle;
   return (
@@ -797,23 +806,22 @@ function FollowedSchedule({ pid, profile, notes, today, width, t, onHistory, onR
       )}
       {profile === undefined && <ActivityIndicator color={C.primary} style={{ marginTop: 14 }} />}
       {profile === "denied" && <Text style={[s.muted, { marginTop: 12 }]}>{t.noLongerAvailable}</Text>}
-      {profile && profile !== "denied" && !sch && <Text style={[s.muted, { marginTop: 12 }]}>{t.noScheduleYet}</Text>}
+      {known && !sch && <Text style={[s.muted, { marginTop: 12 }]}>{hasNotes ? t.notesOnly : t.noScheduleYet}</Text>}
       {todaysNote && <View style={{ marginTop: 12 }}><NoteLine note={todaysNote} label={t.todaysNote} /></View>}
-      {canUnlock && <Button title={t.unlockSharedNotes} kind="secondary" compact icon={LockKeyhole} onPress={() => onUnlock(sch!.name || pid)} />}
+      {canUnlock && <Button title={t.unlockSharedNotes} kind="secondary" compact icon={LockKeyhole} onPress={() => onUnlock(sch?.name || handle)} />}
       {waiting && <Text style={[s.small, { marginTop: 10, color: C.muted }]}>🔒 {t.notesWaiting}</Text>}
       {sch && (methodOf(sch) === "pill"
         ? <PackView sch={sch} today={today} width={Math.min(width - 82, 400)} />
         : <MethodVisual plan={sch} today={todayOf(sch)} width={width} t={t} lang={lang} />)}
       <View style={[st.divider, { marginBottom: 0 }]} />
       <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
-        {sch ? <LinkButton title={t.history} icon={CalendarDays} onPress={onHistory} /> : <View />}
+        {sch || hasNotes ? <LinkButton title={t.history} icon={CalendarDays} onPress={onHistory} /> : <View />}
         <LinkButton title={t.unsubscribe} icon={UserMinus} color={C.textSoft} onPress={onRemove} />
       </View>
     </Card>
   );
 }
 
-/** Under the owner's taken time: who confirmed they've seen it (like a read receipt). */
 /**
  * A confirmation of today's pill, or of the patch / ring / injection action done today. Methods: only if given after it
  * was done (a second action on the same day, e.g. after switching methods, isn't seen yet).
@@ -825,6 +833,7 @@ function seenSinceDone(sch: Schedule, x: Seen) {
   return !done?.time || x.at >= zonedTime(today, done.time, sch.tz);
 }
 
+/** Under the owner's taken time: who confirmed they've seen it (like a read receipt). */
 function SeenLine({ seen, tz, t }: { seen: Seen[]; tz: string; t: Strings }) {
   if (!seen.length) return null;
   const names = seen.map((x) => x.name).filter((n): n is string => !!n);

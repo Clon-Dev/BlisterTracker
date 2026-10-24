@@ -244,6 +244,14 @@ export function withAction(p: Plan, scheduled: string, done: { day: string; time
 }
 
 /** The scheduled day of the action still open on `day` (due that day, or carried over and not done yet), or null. */
+export type DayState = "done" | "late" | "missed" | "open" | "future";
+/** State of the action scheduled on `day` as of `today`: done (on the day), late (on a later day), missed, open or future. */
+export function actionState(p: Plan, day: string, today: string): DayState {
+  const done = doneAt(p, day);
+  if (done || isTaken(p, day)) return done && done.day !== day ? "late" : "done";
+  if (day > today) return "future";
+  return openActionDay(p, today) === day ? "open" : "missed";
+}
 export function openActionDay(p: Plan, day: string): string | null {
   for (let back = 0; back <= CARRY_DAYS[methodOf(p)]; back++) {
     const d = addDays(day, -back);

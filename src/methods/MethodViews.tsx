@@ -3,22 +3,12 @@ import { Pressable, Text, View } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { Check, Clock3, X } from "lucide-react-native";
 import Svg, { Circle, Path } from "react-native-svg";
-import {
-  addDays, cycleLength, diffDays, doneAt, isTaken, openActionDay, slot, type Plan,
-} from "../../shared/schedule";
+import { actionState, addDays, cycleLength, diffDays, openActionDay, slot, type DayState, type Plan } from "../../shared/schedule";
 import { formatDay, useI18n } from "../i18n";
 import { C, F, R, themedStyles } from "../theme";
 import { s } from "../ui";
 
-export type DayState = "done" | "late" | "missed" | "open" | "future";
-
-/** State of the action scheduled on `day` as of `today`. */
-export function actionState(p: Plan, day: string, today: string): DayState {
-  const done = doneAt(p, day);
-  if (done || isTaken(p, day)) return done && done.day !== day ? "late" : "done";
-  if (day > today) return "future";
-  return openActionDay(p, today) === day ? "open" : "missed";
-}
+export { actionState };
 
 const stateColor = (st: DayState) =>
   st === "done" ? C.success : st === "late" ? C.warning : st === "missed" ? C.danger : st === "open" ? C.primary : C.muted;

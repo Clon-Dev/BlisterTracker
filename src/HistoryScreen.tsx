@@ -1,13 +1,12 @@
 import { useState } from "react";
 import { Pressable, Text, View } from "react-native";
-import { ChevronLeft, ChevronRight } from "lucide-react-native";
-import { actionOn, addDays, dayKey, doneAt, firstEditableDay, isTaken, methodOf, movedTo, slot, weekday } from "../shared/schedule";
-import type { Note, Schedule } from "./data";
+import { ChevronLeft, ChevronRight, FileDown } from "lucide-react-native";
+import { actionOn, actionState, addDays, dayKey, doneAt, firstEditableDay, isTaken, methodOf, movedTo, slot, weekday } from "../shared/schedule";
+import { deviceTz, type Note, type Schedule } from "./data";
 import { NoteLine, openNoteSheet, type OwnNote } from "./HomeCards";
 import { formatDay, formatMonth, useI18n } from "./i18n";
-import { actionState } from "./methods/MethodViews";
 import { C, F, themedStyles } from "./theme";
-import { Card, Header, IconButton, ProgressRing, s } from "./ui";
+import { Card, Header, IconButton, LinkButton, ProgressRing, s } from "./ui";
 
 // Patch / ring / injection add "late" (done on a later day), "moved" (a cycle start done later, which moved the cycle),
 // "wearing" (a day between actions) and "plain" (the injection's days between injections).
@@ -17,11 +16,16 @@ type Status = "taken" | "late" | "moved" | "missed" | "break" | "open" | "untrac
  * Month calendar of a schedule plus the month's notes. Owner only (`ownerPid`/`onEditDay`): correct days and edit notes;
  * followers see the shared notes.
  */
-export function HistoryScreen({ schedule, notes, owner, onEditDay, onBack }: {
-  schedule: Schedule; notes: Record<string, Note | OwnNote>; owner?: { uid: string; pid: string }; onEditDay?: (day: string) => void; onBack: () => void;
+export function HistoryScreen({ schedule: plan, notes, owner, title, onEditDay, onExport, onBack }: {
+  /** null: no contraception plan, only notes (the calendar marks the days with a note). */
+  schedule: Schedule | null; notes: Record<string, Note | OwnNote>; owner?: { uid: string; pid: string };
+  /** Shown when there's no schedule name (e.g. the username). */ title?: string;
+  onEditDay?: (day: string) => void; onExport?: () => void; onBack: () => void;
 }) {
   const { t, lang } = useI18n();
-  const today = dayKey(Date.now(), schedule.tz);
+  // Without a plan the calendar is a plain one; the helpers below only run with a plan.
+  const schedule = plan ?? NO_PLAN;
+  const today = dayKey(Date.now(), plan?.tz ?? deviceTz());
   const [month, setMonth] = useState({ year: +today.slice(0, 4), month: +today.slice(5, 7) - 1 });
 
   const first = `${month.year}-${String(month.month + 1).padStart(2, "0")}-01`;
@@ -44,6 +48,7 @@ export function HistoryScreen({ schedule, notes, owner, onEditDay, onBack }: {
     return slot(schedule, day).kind === "break" ? "break" : method === "injection" ? "plain" : "wearing";
   };
   const status = (day: string): Status => {
+    if (!plan) return "plain";
     if (!pill) return methodStatus(day);
     if (day in schedule.takenDays) return "taken"; // a marked day always shows, even if it now falls into a break
     const kind = slot(schedule, day).kind;
@@ -76,9 +81,9 @@ export function HistoryScreen({ schedule, notes, owner, onEditDay, onBack }: {
 
   return (
     <View>
-      <Header title={t.history} subtitle={schedule.name || undefined} onBack={onBack} />
+      <Header title={t.history} subtitle={plan?.name || title} onBack={onBack} />
 
-      <Card>
+      {plan && <Card>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 18 }}>
           <ProgressRing progress={rate} size={84} stroke={8}>
             <Text style={[F.extrabold, { fontSize: 20, color: C.text }]}>{Math.round(rate * 100)}%</Text>
@@ -91,7 +96,7 @@ export function HistoryScreen({ schedule, notes, owner, onEditDay, onBack }: {
             </View>
           </View>
         </View>
-      </Card>
+      </Card>}
 
       <Card>
         <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
@@ -137,7 +142,7 @@ export function HistoryScreen({ schedule, notes, owner, onEditDay, onBack }: {
           </View>
           ))}
         </View>
-        <View style={st.legend}>
+        {plan && <View style={st.legend}>
           {legend.map(([k, label]) => (
             <View key={k} style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
               <View style={[{ width: 14, height: 14, borderRadius: 7 }, dayStyle[k]]} />
@@ -145,7 +150,7 @@ export function HistoryScreen({ schedule, notes, owner, onEditDay, onBack }: {
             </View>
           ))}
           {pill && <Text style={s.small}>• {t.legendPlacebo}</Text>}
-        </View>
+        </View>}
         {onEditDay && <Text style={[s.small, { textAlign: "center", marginTop: 12 }]}>{pill ? t.historyHint : t.historyHintMethod}</Text>}
       </Card>
 
@@ -161,9 +166,16 @@ export function HistoryScreen({ schedule, notes, owner, onEditDay, onBack }: {
             : <View key={day}>{line}</View>;
         })}
       </Card>
+      {onExport && <LinkButton title={t.exportOpenRow} icon={FileDown} onPress={onExport} />}
     </View>
   );
 }
+
+/** Stand-in plan for the helpers when there's none (the calendar then shows every day plainly). */
+const NO_PLAN: Schedule = {
+  pillsPerPack: 28, placebo: 0, breakDays: 0, packStart: "2000-01-01", trackingSince: "2000-01-01", time: "00:00", tz: "UTC",
+  repeatMinutes: 0, lateMinutes: 0, takenDays: {},
+} as unknown as Schedule;
 
 const Stat = ({ color, label, n }: { color: string; label: string; n: number }) => (
   <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>

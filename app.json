@@ -2,7 +2,7 @@
   "expo": {
     "name": "Blister Buddy",
     "slug": "blister-buddy",
-    "version": "1.5.2",
+    "version": "1.6.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -18,7 +18,7 @@
         "android.permission.POST_NOTIFICATIONS",
         "android.permission.REQUEST_INSTALL_PACKAGES"
       ],
-      "versionCode": 10
+      "versionCode": 11
     },
     "web": {
       "name": "Blister Buddy",
@@ -38,7 +38,8 @@
       ],
       "expo-localization",
       "expo-font",
-      "expo-secure-store"
+      "expo-secure-store",
+      "expo-sharing"
     ],
     "extra": {
       "eas": {

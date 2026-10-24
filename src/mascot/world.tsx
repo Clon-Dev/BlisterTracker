@@ -205,7 +205,8 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, name, onTakePil
   const roomHeight = (id: string) => roomNow.get(id) ?? 0;
   /** Top-left of the kitten sitting in `id`'s room at `x`, with the room `room` high. */
   const seatPos = (id: string, x: number, room: number) => {
-    const f = frames.get(id)!;
+    const f = frames.get(id);
+    if (!f) return posNow.current; // the block just unmounted (e.g. moved elsewhere): stay where the kitten is
     return { x: f.x + x - layer.current.x, y: f.y + room + f.inset + 2 - KH - layer.current.y };
   };
   const view = () => ({ top: scrollNow.current - layer.current.y, bottom: scrollNow.current - layer.current.y + scroll.viewport });
@@ -276,7 +277,8 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, name, onTakePil
     if (from) await wait(280); // the old room closes; positions below it settle
     if (trip !== travel.current) return;
     const side: "left" | "right" = Math.random() < 0.5 ? "left" : "right";
-    const f = frames.get(id)!;
+    const f = frames.get(id);
+    if (!f) return lost(); // the target block went away meanwhile
     const x = side === "left" ? SEAT_PAD : f.width - KW - SEAT_PAD;
     const room = baseRoom(f.inset);
     const target = seatPos(id, x, room); // the block's own room doesn't move it, so this holds before it opens
@@ -321,8 +323,17 @@ function World({ scroll, day, getPill, takenToday, hasNoteToday, name, onTakePil
       await moveTo(target, Math.max(250, Math.abs(target.x - edge) * 3.5), Easing.linear);
     }
     if (trip !== travel.current) return;
+    if (!frames.get(id)) return lost();
     sitDown(id, x, side);
     busy.current = false;
+  };
+  /** The block the kitten was heading for is gone: appear again somewhere else (as when a seat's block unmounts). */
+  const lost = () => {
+    busy.current = false;
+    setSeat(null);
+    setRoaming(null);
+    started.current = false;
+    setLayout((n) => n + 1);
   };
   const roamingClinging = () => modeRef.current === "climb";
 

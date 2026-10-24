@@ -36,7 +36,8 @@ Owners track their blister pack, patch, ring or injection; followers (username +
 - **Supplies & appointments**: "unopened packs at home" is stored as `supplyPacks`/`supplyFrom`. The owner gets a refill notice when the last pack starts, and an appointment notice the day before at the reminder time. Both use `nextNoticeAt`, which the Worker's fourth job processes.
 - **Own reminder text**: `reminderText` (up to 64 characters, emoji allowed) replaces the owner's reminder wording and becomes the notification title.
 - **Starting a pack early** (to delay a period, on medical advice): moves `packStart` and keeps the old start in `earlierPackStarts`, so past days keep their pack position.
-- **Daily notes**: a mood and free text per day in `users/{pid}/notes/shared` (followers can read it) or `notes/private` (owner only, enforced by the rules).
+- **Daily notes**: a mood and free text per day in `users/{pid}/notes/shared` (followers can read it) or `notes/private` (owner only, enforced by the rules). Accounts without a contraception plan have the notes card on the home screen too ("All my notes" opens the calendar of notes), and their followers see the shared notes.
+- **Export** (Account → "Export my data", or from the history): the own daily data for a period (7 days to 12 months, or custom) as **PDF** or **CSV**, with a choice of columns: date, mood, note, and with a plan what was due, taken/done (`[x]`/`[ ]`), time (with the day if done late), remark (missed, late, new pack), cycle position and the doctor's appointment. `src/export.ts` builds the rows, CSV (BOM; `;` in German) and a printable HTML table (A4, landscape with many columns, wide note column, repeating header). Android/iOS: `expo-print` turns it into a PDF and `expo-sharing` opens the share sheet (`src/exportFile.ts`). Web: CSV download, PDF via the browser's print dialog (`src/exportFile.web.ts`). Nothing leaves the device unless the user shares the file.
 - **Travelling**: when the device's time zone differs from the schedule's, a notice shows both times. "Use local time" switches `tz`; "Keep home time" is remembered per zone pair.
 - **Dark mode**: follows the system, with an override (System/Light/Dark) in Account. Palettes live in `src/theme.ts`, and style sheets use `themedStyles(...)` so they rebuild on a switch.
 - **Pushes** are data-only FCM messages. The Android app (`expo-notifications`) and `public/firebase-messaging-sw.js` build the notification from `title`, `message`, `categoryId` and `body`.
@@ -155,6 +156,7 @@ npm run typecheck
 node --env-file=.env scripts/test-rules.mjs   # live security-rules test (creates & deletes throwaway @example.com users)
 node scripts/test-schedule.ts                 # unit tests for shared/schedule.ts (packs, breaks, DST, repeats, late alerts)
 node scripts/test-mascot.ts                   # unit tests for the kitten's logic (src/mascot/brain.ts)
+npx tsx scripts/test-export.ts               # unit tests for the export (rows per method, CSV, PDF table)
 node scripts/facts-index.ts --check          # validates the kitten's facts and checks the generated fact docs are current
 cd worker && npm run dev                      # local worker; trigger with curl "http://localhost:8787/__scheduled"
                                               # needs worker/.dev.vars: SERVICE_ACCOUNT_JSON='<json on one line>' 
