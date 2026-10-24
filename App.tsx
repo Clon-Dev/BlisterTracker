@@ -9,7 +9,7 @@ import { LinearGradient } from "expo-linear-gradient";
 import { onAuthStateChanged, type User } from "firebase/auth";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
-  AlertTriangle, AtSign, BellRing, CalendarDays, Check, CheckCheck, Clock3, Copy, Eye, EyeOff, KeyRound, LockKeyhole, MailWarning, Moon, Pencil, Pill, Plus, SkipForward, SlidersHorizontal, Tag,
+  AlertTriangle, AtSign, BellRing, CalendarDays, CalendarHeart, Check, CheckCheck, Clock3, Copy, Eye, EyeOff, KeyRound, LockKeyhole, MailWarning, Moon, Pencil, Pill, Plus, SkipForward, SlidersHorizontal, Tag,
   UserMinus, UserPlus, UserRound, type LucideIcon,
 } from "lucide-react-native";
 import { actionOn, addDays, clock, cycleLength, dayKey, diffDays, doneOn, firstEditableDay, isTaken, methodOf, openActionDay, slot, trackFromPackStart, zonedTime } from "./shared/schedule";
@@ -22,7 +22,7 @@ import { createKeyring, followedShareKey, loadCachedKey, ownShareKey, syncKeyrin
 import { AuthScreen } from "./src/AuthScreen";
 import { Blister } from "./src/Blister";
 import {
-  deviceTz, recordAction, ensureAccount, cleanUsername, ensureUsername, fetchSharing, hasSchedule, markSeen, setUsername, USERNAME_MAX, usernameAvailable, validUsername, migrateToEncryption, openNotes, registerToken, renameSchedule, setAccountLang, setTaken,
+  deviceTz, recordAction, ensureAccount, cleanUsername, ensureUsername, fetchSharing, hasSchedule, markSeen, setUsername, USERNAME_MAX, usernameAvailable, validUsername, migrateToEncryption, openNotes, registerToken, renameSchedule, setAccountLang, setFollowerOnly, setTaken,
   setTimezone, todayOf, unsubscribe, watchAccount, watchNotes, watchOwnSeen, watchProfile, watchSeen, watchSubscriberCount,
   type Account, type Notes, type Profile, type Schedule, type Seen, type Sharing, type StoredNotes,
 } from "./src/data";
@@ -144,6 +144,11 @@ function Main({ user }: { user: User }) {
   const [privateNotes, setPrivateNotes] = useState<StoredNotes>({});
   const [storedFollowedNotes, setFollowedNotes] = useState<Record<string, StoredNotes>>({});
   const [seen, setSeen] = useState<Seen[]>([]); // followers' confirmations for the own schedule
+  // Hidden "set up your plan" card (accounts/{uid}.followerOnly); the local value shows a change before the write is confirmed.
+  const [followerOnlyNow, setFollowerOnlyNow] = useState<boolean | null>(null);
+  const followerOnly = followerOnlyNow ?? !!account?.followerOnly;
+  useEffect(() => setFollowerOnlyNow(null), [account?.followerOnly]); // confirmed (from this or another device)
+  const changeFollowerOnly = (v: boolean) => { setFollowerOnlyNow(v); queued(setFollowerOnly(uid, v)); };
   const [followedSeen, setFollowedSeen] = useState<Record<string, Seen | null>>({}); // own confirmations per followed schedule
   const [keptZones, setKeptZones] = useState<string | null>(null);
   const [release, setRelease] = useState<Release | null>(null);
@@ -391,7 +396,8 @@ function Main({ user }: { user: User }) {
     // key: each screen starts scrolled to the top; a theme switch redraws everything with the new palette.
     <Animated.ScrollView key={`${screen}-${themeVersion}`} ref={mascotScroll.ref} contentContainerStyle={scrollContent} keyboardShouldPersistTaps="handled"
       onScroll={mascotScroll.onScroll} scrollEventThrottle={16} onLayout={mascotScroll.onLayout}>
-      {screen === "account" && <AccountScreen user={user} account={account} pushToken={pushToken} onBack={home} onUpdateFound={setRelease} />}
+      {screen === "account" && <AccountScreen user={user} account={account} pushToken={pushToken} onBack={home} onUpdateFound={setRelease}
+        followerOnly={schedule ? null : followerOnly} onFollowerOnly={changeFollowerOnly} />}
       {screen === "password" && <PasswordForm uid={uid} pid={account.pid} name={username} hasPassword={sharing.set} onSaved={(password) => { setSharing({ set: true, password }); home(); }} onBack={home} />}
       {screen === "subscribe" && <SubscribeForm uid={uid} ownPid={account.pid} onBack={home} />}
       {screen === "schedule" && <ScheduleWizard uid={uid} pid={account.pid} current={own} width={width} onBack={home} />}
@@ -454,12 +460,15 @@ function Main({ user }: { user: User }) {
                 <NoteCard uid={uid} pid={account.pid} day={todayOf(schedule)} note={ownNotes[todayOf(schedule)] ?? null} focusKey={noteFocus} />
               </MascotSpot>}
               after={<MascotSpot id="supplies"><SuppliesCard pid={account.pid} schedule={schedule} /></MascotSpot>} />
-          : <MascotSpot id="setup"><SetupCard t={t} onCreate={() => setScreen("schedule")} /></MascotSpot>}
+          : !followerOnly && <MascotSpot id="setup"><SetupCard t={t} onCreate={() => setScreen("schedule")}
+            onFollowerOnly={() => { changeFollowerOnly(true); toast(t.followerOnlyToast); }} /></MascotSpot>}
 
         <MascotSpot id="id"><IdCard username={username} sharing={sharing} followers={subscriberCount} t={t} onPassword={() => setScreen("password")}
           onEditUsername={() => openSheet<void>((done) => <UsernameSheet uid={uid} pid={account.pid} current={username} t={t} done={done} />)} /></MascotSpot>
 
         <Button title={t.followSchedule} icon={UserPlus} onPress={() => setScreen("subscribe")} style={{ marginTop: 18 }} />
+        {/* Hidden setup card: the way back to an own plan. */}
+        {!schedule && followerOnly && <LinkButton title={t.ownPlanLink} icon={Plus} onPress={() => setScreen("schedule")} />}
 
         {account.subs.length > 0 && <SectionTitle title={t.following} />}
         {account.subs.map((p) => (
@@ -498,16 +507,21 @@ function Notice({ icon: Icon, tone, text, action, onAction }: {
   );
 }
 
-function SetupCard({ t, onCreate }: { t: Strings; onCreate: () => void }) {
+function SetupCard({ t, onCreate, onFollowerOnly }: { t: Strings; onCreate: () => void; onFollowerOnly: () => void }) {
   return (
     <LinearGradient colors={G.hero} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={[st.hero, shadow(3)]}>
       <View style={st.heroBubble} />
       <View style={[st.iconDot, { width: 52, height: 52, borderRadius: 26, backgroundColor: "rgba(255,255,255,0.22)" }]}>
-        <Pill size={26} color={C.white} strokeWidth={2.2} />
+        <CalendarHeart size={26} color={C.white} strokeWidth={2.2} />
       </View>
       <Text style={[s.h1, { color: C.white, marginTop: 14 }]}>{t.setupTitle}</Text>
       <Text style={[s.body, { color: "rgba(255,255,255,0.88)", marginTop: 6 }]}>{t.setupBody}</Text>
       <Button title={t.createSchedule} kind="light" icon={Plus} onPress={onCreate} style={{ marginTop: 18 }} />
+      <Pressable onPress={onFollowerOnly} accessibilityRole="button" accessibilityLabel={t.followerOnlyButton} hitSlop={6}
+        style={{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, marginTop: 14, paddingVertical: 6 }}>
+        <EyeOff size={16} color={C.white} strokeWidth={2.4} />
+        <Text style={[s.small, F.bold, { color: C.white, flexShrink: 1, textAlign: "center" }]}>{t.followerOnlyButton}</Text>
+      </Pressable>
     </LinearGradient>
   );
 }

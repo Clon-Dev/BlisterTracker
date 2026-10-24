@@ -50,6 +50,8 @@ try {
   await expect("bob creates his account", true, () => setDoc(doc(bob.db, "accounts", bob.user.uid), { pid: B, subs: [], tokens: [] }));
   await expect("bob sets his notification language", true, () => updateDoc(doc(bob.db, "accounts", bob.user.uid), { lang: "de" }));
   await expect("bob cannot set an unknown language", false, () => updateDoc(doc(bob.db, "accounts", bob.user.uid), { lang: "xx" }));
+  await expect("bob hides the setup card (only follows)", true, () => updateDoc(doc(bob.db, "accounts", bob.user.uid), { followerOnly: true }));
+  await expect("followerOnly must be a boolean", false, () => updateDoc(doc(bob.db, "accounts", bob.user.uid), { followerOnly: "yes" }));
   await expect("alice stores her encryption keyring", true, () => updateDoc(doc(alice.db, "accounts", alice.user.uid), { keyring: { v: 1, pwSalt: "s", pw: "v1:x", rcSalt: "r", rc: "v1:y" } }));
   await expect("alice adds a share-key wrap before having a schedule", true, () => updateDoc(doc(alice.db, "users", A), { shareKeyWrap: "salt|v1:abc" }));
   await expect("alice cannot add other fields to a schedule-less profile", false, () => updateDoc(doc(alice.db, "users", A), { evil: true }));

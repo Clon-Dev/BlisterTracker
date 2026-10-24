@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Platform, Pressable, Text, View } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import type { User } from "firebase/auth";
-import { AlertCircle, BadgeCheck, Cat, ChevronRight, KeyRound, LifeBuoy, Lock, LogOut, Mail, MailWarning, RefreshCw, ShieldCheck, SunMoon, Trash2, type LucideIcon } from "lucide-react-native";
+import { AlertCircle, BadgeCheck, Cat, ChevronRight, House, KeyRound, LifeBuoy, Lock, LogOut, Mail, MailWarning, RefreshCw, ShieldCheck, SunMoon, Trash2, type LucideIcon } from "lucide-react-native";
 import { authErrorText, changeEmail, changePassword, deleteAccount, logout, resendVerification } from "./auth";
 import { deleteAccountData, removeToken, type Account } from "./data";
 import { openRecoveryCodeSheet } from "./EncryptionScreens";
@@ -14,8 +14,10 @@ import { checkForUpdate, currentVersion, type Release } from "./update";
 import { C, F, G, R, setAppearance, themedStyles, useAppearance, type Appearance } from "./theme";
 import { Badge, Button, Card, ChipGroup, Field, Header, s, Toggle } from "./ui";
 
-export function AccountScreen({ user, account, pushToken, onBack, onUpdateFound }: {
+export function AccountScreen({ user, account, pushToken, onBack, onUpdateFound, followerOnly, onFollowerOnly }: {
   user: User; account: Account; pushToken: string | null; onBack: () => void; onUpdateFound: (r: Release) => void;
+  /** Hidden "set up your plan" card; null when the account has its own schedule (no card to hide). */
+  followerOnly: boolean | null; onFollowerOnly: (v: boolean) => void;
 }) {
   const { t } = useI18n();
   const appearance = useAppearance();
@@ -61,6 +63,16 @@ export function AccountScreen({ user, account, pushToken, onBack, onUpdateFound 
           { label: t.appearanceSystem, value: "system" }, { label: t.appearanceLight, value: "light" }, { label: t.appearanceDark, value: "dark" },
         ]} />
       </Card>
+
+      {followerOnly !== null && (
+        <Card>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+            <House size={19} color={C.primaryDeep} strokeWidth={2.3} />
+            <Text style={[s.body, F.bold]}>{t.homeSettings}</Text>
+          </View>
+          <Toggle label={t.followerOnlyToggle} value={followerOnly} onChange={onFollowerOnly} />
+        </Card>
+      )}
 
       <Card>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>

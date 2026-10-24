@@ -142,7 +142,7 @@ export function Toggle({ label, value, onChange }: { label: string; value: boole
   const x = useRef(new Animated.Value(value ? 1 : 0)).current;
   useEffect(() => { Animated.spring(x, { toValue: value ? 1 : 0, useNativeDriver: false, speed: 30, bounciness: 4 }).start(); }, [value, x]);
   return (
-    <Pressable onPress={() => onChange(!value)} accessibilityRole="switch" accessibilityLabel={label} accessibilityState={{ checked: value }}
+    <Pressable onPress={() => onChange(!value)} accessibilityRole="switch" accessibilityLabel={label} accessibilityState={{ checked: value }} aria-checked={value}
       style={{ flexDirection: "row", alignItems: "center", gap: 14, marginTop: 18 }}>
       <Text style={[s.body, { flex: 1 }]}>{label}</Text>
       <Animated.View style={[st.track, { backgroundColor: x.interpolate({ inputRange: [0, 1], outputRange: [C.switchOff, C.primary] }) }]}>

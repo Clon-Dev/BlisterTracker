@@ -12,7 +12,8 @@ import {
 } from "./keys";
 import { strings, type Lang } from "./i18n";
 
-export type Account = { pid: string; subs: string[]; tokens: string[]; lang?: Lang; keyring?: Keyring };
+/** `followerOnly`: the owner hid the "set up your plan" card (only follows others). */
+export type Account = { pid: string; subs: string[]; tokens: string[]; lang?: Lang; keyring?: Keyring; followerOnly?: boolean };
 /** users/{pid} with a schedule. The worker reads the same fields (see shared/schedule.ts). */
 export type Schedule = Plan & {
   ownerUid: string;
@@ -192,6 +193,7 @@ export const renameSchedule = (pid: string, name: string) => updateDoc(userRef(p
 
 /** Language for this account's push notifications (read by the worker). */
 export const setAccountLang = (uid: string, lang: Lang) => updateDoc(accountRef(uid), { lang });
+export const setFollowerOnly = (uid: string, followerOnly: boolean) => updateDoc(accountRef(uid), { followerOnly });
 
 export async function saveSchedule(uid: string, pid: string, input: ScheduleInput, previous: Profile | null) {
   const prev = hasSchedule(previous) ? previous : null;

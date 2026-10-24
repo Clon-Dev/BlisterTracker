@@ -81,7 +81,8 @@ service cloud.firestore {
     match /accounts/{uid} {
       allow read, delete: if signedIn() && request.auth.uid == uid;
       allow create, update: if signedIn() && request.auth.uid == uid
-        && request.resource.data.keys().hasOnly(['pid', 'subs', 'tokens', 'lang', 'keyring'])
+        && request.resource.data.keys().hasOnly(['pid', 'subs', 'tokens', 'lang', 'keyring', 'followerOnly'])
+        && (!('followerOnly' in request.resource.data) || request.resource.data.followerOnly is bool)
         // Encryption keyring (wrapped keys only; see src/keys.ts).
         && (!('keyring' in request.resource.data) || (request.resource.data.keyring is map && request.resource.data.keyring.size() <= 8))
         && (!('lang' in request.resource.data) || request.resource.data.lang in ['en', 'de'])
