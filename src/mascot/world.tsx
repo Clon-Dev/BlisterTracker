@@ -780,7 +780,8 @@ function World({
           {showBubble && message && (
             <View style={[{ position: "absolute", bottom: -(inset - 6), maxWidth: Math.min(300, Math.max(160, width - KW - SEAT_PAD * 2 - 14)) },
               seat.side === "left" ? { left: SEAT_PAD + KW + 12 } : { right: SEAT_PAD + KW + 12 }]}>
-              <Bubble key={message.key} content={message.render(t, lang)} kittenSide={seat.side} onHeight={setBubbleHeight} />
+              {/* Keyed by language too: after a switch the bubble is laid out from scratch, not resized in place. */}
+              <Bubble key={`${message.key}-${lang}`} content={message.render(t, lang)} kittenSide={seat.side} onHeight={setBubbleHeight} />
             </View>
           )}
         </>

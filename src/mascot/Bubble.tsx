@@ -32,17 +32,34 @@ export function Bubble({ content, kittenSide, onHeight }: { content: BubbleConte
       )}
       {!!content.buttons?.length && (
         <View style={st.buttons}>
-          {content.buttons.map((b) => (
-            <Pressable key={b.label} onPress={b.onPress} accessibilityRole="button" accessibilityLabel={b.label}
-              style={({ pressed }) => [st.button, b.primary ? st.primary : st.secondary, pressed && { opacity: 0.75 }]}>
-              <Text style={[st.buttonText, { color: b.primary ? C.white : C.primaryDeep }]}>{b.label}</Text>
-            </Pressable>
-          ))}
+          {content.buttons.map((b) => {
+            const color = { color: b.primary ? C.white : C.primaryDeep };
+            const { emoji, text } = splitEmoji(b.label);
+            return (
+              <Pressable key={b.label} onPress={b.onPress} accessibilityRole="button" accessibilityLabel={b.label}
+                style={({ pressed }) => [st.button, b.primary ? st.primary : st.secondary, pressed && { opacity: 0.75 }]}>
+                {/* Emoji and words as separate one-line texts: Android can measure an emoji a little narrower than it
+                    draws it, which used to push the words onto a hidden second line (only the emoji showed). */}
+                {emoji && <Text style={[st.buttonText, color]} numberOfLines={1} textBreakStrategy="simple">{emoji}</Text>}
+                {!!text && <Text style={[st.buttonText, color]} numberOfLines={1} textBreakStrategy="simple">{text}</Text>}
+              </Pressable>
+            );
+          })}
         </View>
       )}
     </Animated.View>
   );
 }
+
+/** A label's leading emoji ("💜 Herstory" → "💜", "Herstory"), if it starts with one. */
+export function splitEmoji(label: string): { emoji: string | null; text: string } {
+  const m = LEADING_EMOJI?.exec(label);
+  return m ? { emoji: m[1], text: m[2] } : { emoji: null, text: label };
+}
+// Built once, guarded: an engine without Unicode property escapes just keeps labels whole.
+const LEADING_EMOJI = (() => {
+  try { return new RegExp("^(\\p{Extended_Pictographic}(?:\\uFE0F|\\u200D\\p{Extended_Pictographic})*)\\s*(.*)$", "su"); } catch { return null; }
+})();
 
 /** "…" while the kitten is on its way (the bubble opens again where it settles). */
 export function TypingDots() {
@@ -71,7 +88,7 @@ const st = themedStyles(() => ({
   text: { ...F.medium, fontSize: 14, lineHeight: 20, color: C.text },
   source: { ...F.semibold, fontSize: 12, color: C.muted },
   buttons: { flexDirection: "row" as const, flexWrap: "wrap" as const, gap: 6, marginTop: 9 },
-  button: { borderRadius: R.full, paddingHorizontal: 13, paddingVertical: 7 },
+  button: { flexDirection: "row" as const, alignItems: "center" as const, gap: 5, flexShrink: 0, borderRadius: R.full, paddingHorizontal: 13, paddingVertical: 7 },
   primary: { backgroundColor: C.primary },
   secondary: { backgroundColor: C.primarySoft },
   buttonText: { ...F.bold, fontSize: 13 },
