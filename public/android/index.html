@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blister Buddy for Android</title>
+<meta name="theme-color" content="#F7F1F4" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#120C10" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="/icon-192.png">
+<style>
+  :root { --bg: #F7F1F4; --card: #FFFFFF; --text: #2B1D24; --muted: #6B5A62; --primary: #C2577A; --primary-deep: #A33B60; --border: #EBDDE3; --soft: #FBE9EF; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #120C10; --card: #1C1419; --text: #F6EAF0; --muted: #B9A5AE; --primary: #E0708F; --primary-deep: #F0A0B8; --border: #33262D; --soft: #2A1C23; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--text); font: 16px/1.5 -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; display: flex; justify-content: center; padding: 28px 16px; }
+  main { width: 100%; max-width: 440px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 22px; padding: 24px; margin-top: 16px; }
+  header { display: flex; align-items: center; gap: 14px; }
+  header img { width: 56px; height: 56px; border-radius: 14px; }
+  h1 { font-size: 22px; margin: 0; letter-spacing: -0.3px; }
+  .sub { color: var(--muted); font-size: 14px; margin: 2px 0 0; }
+  .button { display: block; text-align: center; text-decoration: none; background: var(--primary); color: #fff; font-weight: 700; padding: 15px 18px; border-radius: 16px; margin-top: 18px; }
+  .button[aria-disabled="true"] { opacity: .5; pointer-events: none; }
+  .version { color: var(--muted); font-size: 14px; text-align: center; margin: 10px 0 0; }
+  h2 { font-size: 16px; margin: 0 0 8px; }
+  ol { margin: 0; padding-left: 20px; color: var(--text); }
+  li { margin: 6px 0; }
+  .note { background: var(--soft); border-radius: 14px; padding: 12px 14px; font-size: 14px; color: var(--text); margin-top: 14px; }
+  a.link { color: var(--primary-deep); font-weight: 600; }
+  .lang { float: right; font-size: 13px; }
+  .lang button { background: none; border: 0; color: var(--muted); font: inherit; cursor: pointer; padding: 2px 6px; }
+  .lang button[aria-pressed="true"] { color: var(--primary-deep); font-weight: 700; }
+  .small { font-size: 13px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <div class="lang"><button data-l="en">EN</button> · <button data-l="de">DE</button></div>
+  <header>
+    <img src="/icon-192.png" alt="">
+    <div><h1>Blister Buddy</h1><p class="sub" data-t="sub"></p></div>
+  </header>
+
+  <div class="card">
+    <a id="download" class="button" href="#" aria-disabled="true" data-t="download"></a>
+    <p id="version" class="version"></p>
+    <div id="news" class="note" hidden></div>
+  </div>
+
+  <div class="card">
+    <h2 data-t="howTitle"></h2>
+    <ol>
+      <li data-t="how1"></li>
+      <li data-t="how2"></li>
+      <li data-t="how3"></li>
+    </ol>
+    <p class="small" data-t="updates" style="margin-top:14px"></p>
+  </div>
+
+  <div class="card">
+    <h2 data-t="otherTitle"></h2>
+    <p class="small" style="margin:0"><span data-t="other"></span> <a class="link" href="/">blisterbuddy-8e7a4.web.app</a></p>
+  </div>
+</main>
+<script>
+  var T = {
+    en: {
+      sub: "Android app (APK)", download: "Download the app", howTitle: "Install",
+      how1: "Open this page on your Android phone and tap “Download the app”.",
+      how2: "Open the downloaded file. If Android asks, allow installs from your browser (“Install unknown apps”), once.",
+      how3: "Create an account in the app, or log in.",
+      updates: "After that, the app offers new versions itself (Account → Check for updates). Your login and data stay.",
+      otherTitle: "No Android?", other: "The same app runs in any browser, and on iPhone you can add it to your home screen:",
+      version: "Version ", unavailable: "The download isn't available right now. Please try again later.", published: "Published "
+    },
+    de: {
+      sub: "Android-App (APK)", download: "App herunterladen", howTitle: "Installieren",
+      how1: "Öffne diese Seite auf deinem Android-Handy und tippe auf „App herunterladen“.",
+      how2: "Öffne die heruntergeladene Datei. Wenn Android fragt, erlaube einmalig Installationen aus deinem Browser („Unbekannte Apps installieren“).",
+      how3: "Lege in der App ein Konto an oder melde dich an.",
+      updates: "Danach bietet dir die App neue Versionen selbst an (Konto → Nach Updates suchen). Login und Daten bleiben erhalten.",
+      otherTitle: "Kein Android?", other: "Dieselbe App läuft in jedem Browser, und auf dem iPhone kannst du sie zum Home-Bildschirm hinzufügen:",
+      version: "Version ", unavailable: "Der Download ist gerade nicht verfügbar. Bitte versuche es später noch einmal.", published: "Veröffentlicht "
+    }
+  };
+  var lang = (function () { try { var s = localStorage.getItem("dl-lang"); if (s === "en" || s === "de") return s; } catch (e) {} return (navigator.language || "en").slice(0, 2) === "de" ? "de" : "en"; })();
+  var release = null;
+  function render() {
+    var t = T[lang];
+    document.documentElement.lang = lang;
+    document.querySelectorAll("[data-t]").forEach(function (el) { el.textContent = t[el.getAttribute("data-t")]; });
+    document.querySelectorAll(".lang button").forEach(function (b) { b.setAttribute("aria-pressed", String(b.getAttribute("data-l") === lang)); });
+    var v = document.getElementById("version"), news = document.getElementById("news"), a = document.getElementById("download");
+    if (!release) return;
+    a.href = release.url; a.removeAttribute("aria-disabled");
+    var date = release.publishedAt ? new Date(release.publishedAt).toLocaleDateString(lang === "de" ? "de-DE" : "en-GB") : "";
+    v.textContent = t.version + release.version + (date ? " · " + t.published + date : "");
+    // Release notes are "English · Deutsch".
+    var parts = (release.notes || "").split(" · ");
+    var text = parts.length === 2 ? parts[lang === "de" ? 1 : 0] : release.notes;
+    news.hidden = !text; news.textContent = text || "";
+  }
+  document.querySelectorAll(".lang button").forEach(function (b) {
+    b.addEventListener("click", function () { lang = b.getAttribute("data-l"); try { localStorage.setItem("dl-lang", lang); } catch (e) {} render(); });
+  });
+  render();
+  fetch("/android/latest.json", { cache: "no-store" }).then(function (r) { if (!r.ok) throw new Error(); return r.json(); }).then(function (r) {
+    if (!/^https:\/\//.test(r.url || "")) throw new Error();
+    release = r; render();
+  }).catch(function () { document.getElementById("version").textContent = T[lang].unavailable; });
+</script>
+</body>
+</html>

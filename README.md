@@ -150,6 +150,8 @@ npm run release:android -- "What's new" # optional notes shown in the update car
 
 The script bumps `version` and `android.versionCode` in `app.json`, builds the APK on EAS (and waits), and checks that its download link delivers an APK. It writes `android/latest.json` (version and link) to `public/android/` and deploys Firebase Hosting. The APK itself stays on Expo's servers, because Firebase Hosting's free plan rejects executable files.
 
+**Download page for sharing:** https://blisterbuddy-8e7a4.web.app/android/ (`public/android/index.html`) reads `latest.json` and always links the newest APK, with install steps in English and German. The link never changes, so it's the one to hand out.
+
 Installed apps check `latest.json` on start (at most every 6 hours), or via Account → "Check for updates". When a higher `versionCode` is available, the app shows "Version x is available · Update app": it downloads the APK with progress and opens the Android installer. Because every build is signed with the same EAS key, the update installs in place and keeps the login and all app data. The first time, Android asks to allow installs from Blister Buddy.
 
 Notes:

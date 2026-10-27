@@ -10,4 +10,4 @@ google-services.json
 GoogleService-Info.plist
 .env
 # Release manifest written by scripts/release-android.mjs
-public/android/
+public/android/latest.json
