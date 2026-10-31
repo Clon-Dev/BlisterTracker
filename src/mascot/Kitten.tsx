@@ -2,9 +2,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Animated, Easing, PanResponder, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 import {
-  ART_H, ART_W, Blush, Body, Bow, ClosedEyes, Collar, Confetti, Crown, Ear, Eyes, Glasses, Hat, Haunch, Head, Muzzle, OUTFITS, Paw, Shadow, Tail,
-  type Expression, type Mouth, type Outfit,
+  ART_H, ART_W, BatWing, Blush, Body, Boot, Bow, BunnyEars, ClosedEyes, Collar, Confetti, Crown, Ear, Earmuffs, Eyes, FlowerCrown, Glasses, Hat, Haunch,
+  Head, Leaves, Mask, Muzzle, Paw, Shadow, Tail, type Expression, type Mouth,
 } from "./art";
+import { EVERYDAY, type Outfit } from "./looks";
 
 const nativeDriver = Platform.OS !== "web";
 const fill = StyleSheet.absoluteFill;
@@ -51,12 +52,12 @@ function useLoop(on: boolean, make: () => Animated.CompositeAnimation, deps: unk
 const timing = (v: Animated.Value, toValue: number, duration: number, easing = Easing.inOut(Easing.quad)) =>
   Animated.timing(v, { toValue, duration, easing, useNativeDriver: nativeDriver });
 
-export function Kitten({ size, mode, facing, expression, talking, hearts, active, reduceMotion, label, outfit = OUTFITS.everyday, crown, badge, onPress, onLongPress, onStroke }: Props) {
+export function Kitten({ size, mode, facing, expression, talking, hearts, active, reduceMotion, label, outfit = EVERYDAY, crown, badge, onPress, onLongPress, onStroke }: Props) {
   const k = size / ART_W;
   const height = (size * ART_H) / ART_W;
   const v = useRef({
     cycle: new Animated.Value(0), blink: new Animated.Value(1), breathe: new Animated.Value(0), tail: new Animated.Value(0),
-    look: new Animated.Value(0), ear: new Animated.Value(0), facing: new Animated.Value(facing),
+    look: new Animated.Value(0), ear: new Animated.Value(0), facing: new Animated.Value(facing), wing: new Animated.Value(0),
   }).current;
   const moving = mode === "walk" || mode === "climb";
   const lively = active && !reduceMotion;
@@ -78,6 +79,10 @@ export function Kitten({ size, mode, facing, expression, talking, hearts, active
   useLoop(lively && mode !== "sleep", () => Animated.loop(Animated.sequence([
     Animated.delay(4800), timing(v.ear, 1, 80), timing(v.ear, -0.35, 80), timing(v.ear, 0, 90),
   ])), []);
+  // Bat wings (Halloween): a slow flutter, quicker on the move.
+  useLoop(lively && !!outfit.wings && mode !== "sleep", () => Animated.loop(Animated.sequence([
+    timing(v.wing, 1, moving ? 180 : 420), timing(v.wing, 0, moving ? 180 : 420), Animated.delay(moving ? 0 : 900),
+  ])), [moving, outfit.wings]);
   useEffect(() => { Animated.spring(v.facing, { toValue: facing, useNativeDriver: nativeDriver, speed: 14, bounciness: 4 }).start(); }, [facing, v]);
   useEffect(() => { if (!moving) v.cycle.setValue(0); }, [moving, v]);
   useEffect(() => { if (mode === "sleep" || !lively) v.look.setValue(0); }, [mode, lively, v]);
@@ -118,16 +123,26 @@ export function Kitten({ size, mode, facing, expression, talking, hearts, active
       style={{ width: size, height }} hitSlop={8}>
       <Shadow size={size} />
       {outfit.confetti && <Confetti size={size} />}
+      {outfit.scarfLeaves && <Leaves size={size} />}
       <Animated.View style={[fill, origin(100, 220), { transform: [{ translateY: bob }, { rotate: moving ? sway : "0deg" }] }]}>
         <Animated.View style={[fill, origin(150, 206), { transform: [{ rotate: v.tail.interpolate({ inputRange: [0, 1], outputRange: ["0deg", "-12deg"] }) }] }]}>
           <Tail size={size} />
         </Animated.View>
+        {outfit.wings && <>
+          <Animated.View style={[fill, origin(60, 150), { transform: [{ rotate: v.wing.interpolate({ inputRange: [0, 1], outputRange: ["0deg", "-16deg"] }) }] }]}>
+            <BatWing size={size} side="l" />
+          </Animated.View>
+          <Animated.View style={[fill, origin(140, 150), { transform: [{ rotate: v.wing.interpolate({ inputRange: [0, 1], outputRange: ["0deg", "16deg"] }) }] }]}>
+            <BatWing size={size} side="r" />
+          </Animated.View>
+        </>}
         <Animated.View style={[fill, { transform: [step(0.5)] }]}><Haunch size={size} side="l" /></Animated.View>
         <Animated.View style={[fill, { transform: [step(0)] }]}><Haunch size={size} side="r" /></Animated.View>
         <Animated.View style={[fill, origin(100, 206), { transform: [{ scaleX: breatheX }, { scaleY: breatheY }] }]}><Body size={size} outfit={outfit} /></Animated.View>
         <Animated.View style={[fill, { transform: [step(0)] }]}><Paw size={size} side="l" outfit={outfit} /></Animated.View>
         <Animated.View style={[fill, { transform: [step(0.5)] }]}><Paw size={size} side="r" outfit={outfit} /></Animated.View>
         <Collar size={size} outfit={outfit} />
+        {outfit.boot && <Boot size={size} />}
         <Animated.View style={[fill, origin(100, 132), {
           transform: [{ rotate: v.look.interpolate({ inputRange: [-1, 0, 1], outputRange: ["-6deg", "0deg", "6deg"] }) }],
         }]}>
@@ -140,15 +155,20 @@ export function Kitten({ size, mode, facing, expression, talking, hearts, active
               <Ear size={size} side="r" />
             </Animated.View>
           </Animated.View>
+          {/* Fake bunny ears sit behind the head, so their headband is hidden. */}
+          {outfit.bunnyEars && !crown && <BunnyEars size={size} />}
           <Head size={size} />
-          {crown ? <Crown size={size} /> : outfit.hat && <Hat size={size} kind={outfit.hat} />}
+          {crown || outfit.crown ? <Crown size={size} /> : outfit.hat && <Hat size={size} kind={outfit.hat} />}
+          {outfit.flowerCrown && <FlowerCrown size={size} />}
+          {outfit.earmuffs && <Earmuffs size={size} />}
           <Animated.View style={[fill, { transform: [{ translateX: faceX }] }]}>
             {expression === "happy" || expression === "sleepy" || mode === "sleep"
               ? <ClosedEyes size={size} kind={expression === "happy" ? "happy" : "sleepy"} />
               : <Animated.View style={[fill, origin(100, 80), { transform: [{ scaleY: v.blink }] }]}><Eyes size={size} /></Animated.View>}
             {expression === "happy" && <Blush size={size} />}
-            <Muzzle size={size} mouth={mode === "sleep" ? "smile" : mouth} />
-            {outfit.glasses && <Glasses size={size} />}
+            <Muzzle size={size} mouth={mode === "sleep" ? "smile" : mouth} fangs={outfit.fangs} />
+            {outfit.glasses && <Glasses size={size} kind={outfit.glasses} />}
+            {outfit.mask && <Mask size={size} />}
           </Animated.View>
         </Animated.View>
       </Animated.View>

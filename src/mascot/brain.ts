@@ -93,8 +93,8 @@ export type Situation = {
   /** Whether today has a note; null when there's no own schedule (nothing to ask about). */
   hasNoteToday: boolean | null;
   factsEnabled: boolean;
-  /** Today's special day (with outfits on), and the year, for "once a year". */
-  special?: SpecialId | null;
+  /** Today's special days in the order to mention them (with outfits on), and the year, for "once a year". */
+  specials?: SpecialId[];
   year?: number;
   /** Current streak of the own schedule and its unit. */
   streak?: { count: number; unit: keyof typeof STREAK_MILESTONES };
@@ -122,8 +122,9 @@ export function nextMessage(s: Situation, m: Memory): Say | null {
   if (s.pill?.soonDays !== undefined && s.pill.soonDays <= 7 && !m.soonSaid && s.openedFor >= 4_000) return { kind: "soon", days: s.pill.soonDays };
   // The very first time: the introduction (what Nyxi can do) comes before anything else.
   if (!m.introduced && !m.greeted && s.openedFor < GREET_WINDOW) return { kind: "greet", part: partOfDay(s.hour), intro: true };
-  // A special day: once a year, instead of the usual greeting.
-  if (s.special && s.year && m.special?.[s.special] !== s.year && s.openedFor >= 1_500) return { kind: "special", id: s.special };
+  // A special day: once a year, instead of the usual greeting. Several on one day each get their turn.
+  const unsaid = s.year ? s.specials?.find((id) => m.special?.[id] !== s.year) : undefined;
+  if (unsaid && s.openedFor >= 1_500) return { kind: "special", id: unsaid };
   const milestone = s.streak ? streakToCelebrate(s.streak.count, s.streak.unit, m.streakSeen) : null;
   if (milestone) return { kind: "streak", days: milestone };
   if (!m.greeted && s.openedFor < GREET_WINDOW) {

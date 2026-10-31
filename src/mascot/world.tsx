@@ -12,13 +12,14 @@ import {
 } from "react-native";
 import { useI18n, type Lang, type Strings } from "../i18n";
 import { useSheetOpen } from "../sheets";
-import { ART_H, ART_W, OUTFITS, type Expression } from "./art";
+import { ART_H, ART_W, type Expression } from "./art";
 import {
   idleAction, nextMessage, pickFact, pickMilestone, pickMyth, rememberAnswer, rememberFact, rememberMilestone, SNOOZE, type PillState,
   type STREAK_MILESTONES,
 } from "./brain";
 import { Bubble, TypingDots, type BubbleContent } from "./Bubble";
-import { nyxiAge, specialDay } from "./calendar";
+import { lookOn, nyxiAge, specialsOn } from "./calendar";
+import { EVERYDAY } from "./looks";
 import { FACTS } from "./facts";
 import { HERSTORY } from "./herstory";
 import { Kitten, type Mode } from "./Kitten";
@@ -551,13 +552,19 @@ function World({
     setTimeout(() => say("note", (t) => ({ text: text(t) }), 3200), 600);
   }), [hiddenToday]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Today's outfit (special days, if switched on); remembered for the wardrobe.
-  const special = outfits ? specialDay(day) : null;
+  // Today's outfit: the special days' print and accessories, or pyjamas late in the evening (looks.ts). With special
+  // outfits switched off: the red sweater (and a streak crown). What was worn is remembered for the wardrobe.
+  const [hour, setHour] = useState(() => new Date().getHours());
+  useEffect(() => { const id = setInterval(() => setHour(new Date().getHours()), 60_000); return () => clearInterval(id); }, []);
   const crown = memoryFor(day).crownDay === day;
+  const specials = useMemo(() => (outfits ? specialsOn(day) : []), [outfits, day]);
+  const look = useMemo(() => (outfits ? lookOn(day, hour, crown) : { outfit: { ...EVERYDAY, ...(crown ? { crown: true } : {}) }, pyjamas: false }),
+    [outfits, day, hour, crown]);
+  const worn = [...(specials.length ? specials.map((s) => s.id) : ["everyday"]), ...(look.pyjamas ? ["pyjamas"] : [])].join(",");
   useEffect(() => {
-    const id = special?.id ?? "everyday";
-    if (!memoryFor(day).outfits?.includes(id)) updateMemory(day, (m) => ({ ...m, outfits: [...(m.outfits ?? []), id] }));
-  }, [special?.id, day]);
+    const ids = worn.split(",").filter((id) => !memoryFor(day).outfits?.includes(id));
+    if (ids.length) updateMemory(day, (m) => ({ ...m, outfits: [...(m.outfits ?? []), ...ids] }));
+  }, [worn, day]);
 
   /** Runs `then` once a scroll we started has come to rest (no scroll events for a moment). */
   const scrollEnd = useRef<{ timer: ReturnType<typeof setTimeout> | null; then: () => void } | null>(null);
@@ -588,7 +595,7 @@ function World({
       const now = Date.now();
       const due = nextMessage({
         now, hour: new Date().getHours(), openedFor: now - openedAt.current, pill: getPill(), hasNoteToday, factsEnabled,
-        special: special?.id ?? null, year: Number(day.slice(0, 4)), streak: streak ?? undefined,
+        specials: specials.map((s) => s.id), year: Number(day.slice(0, 4)), streak: streak ?? undefined,
       }, m);
       if (!due) return;
       if (!seatFits(s, BUBBLE_ROOM)) { // move somewhere the bubble fits on screen first; speak on a later tick
@@ -620,7 +627,7 @@ function World({
         setExpression("sleepy");
         setTimeout(() => setExpression("normal"), 3800);
       } else if (due.kind === "special") {
-        const sp = specialDay(day)!;
+        const sp = specials.find((s) => s.id === due.id)!;
         // Counts as today's fact, so no automatic one follows.
         updateMemory(day, (mem) => ({ ...mem, greeted: true, autoFact: mem.autoFact || !!sp.item, special: { ...mem.special, [sp.id]: Number(day.slice(0, 4)) } }));
         const fact = sp.item?.kind === "fact" ? factByTag(sp.item.tag) : null;
@@ -762,7 +769,7 @@ function World({
   const kitten = (
     <Kitten size={KW} mode={mode} facing={facing} expression={expression} talking={talking} hearts={hearts}
       active={active} reduceMotion={reduceMotion} label={t.mascotLabel} onPress={pet} onLongPress={askHide} onStroke={petMe}
-      outfit={OUTFITS[special?.id ?? "everyday"]} crown={crown} badge={!memoryFor(day).tapped || (factsEnabled && !memoryFor(day).autoFact)} />
+      outfit={look.outfit} badge={!memoryFor(day).tapped || (factsEnabled && !memoryFor(day).autoFact)} />
   );
   const squashStyle = { transformOrigin: "50% 100%", transform: [{ scaleY: squash }, { scaleX: squash.interpolate({ inputRange: [0.8, 1, 1.2], outputRange: [1.12, 1, 0.92] }) }] };
 
@@ -787,7 +794,7 @@ function World({
         </>
       );
     },
-  }), [seat, mode, facing, expression, talking, hearts, active, reduceMotion, message, showBubble, lang, special?.id, crown]); // eslint-disable-line react-hooks/exhaustive-deps
+  }), [seat, mode, facing, expression, talking, hearts, active, reduceMotion, message, showBubble, lang, look]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // On a layer: clamped to the visible part of the page (computed natively while scrolling).
   const layerY = useMemo(() => {

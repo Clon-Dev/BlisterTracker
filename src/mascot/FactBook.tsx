@@ -5,14 +5,16 @@ import { ExternalLink } from "lucide-react-native";
 import { useI18n, type Strings } from "../i18n";
 import { C, F, R, themedStyles } from "../theme";
 import { Badge, Card, Header, s } from "../ui";
-import { OUTFITS } from "./art";
+import { WARDROBE, wardrobeLook, type SpecialId } from "./calendar";
+import { EVERYDAY } from "./looks";
 import { FACTS } from "./facts";
 import { HERSTORY } from "./herstory";
 import { Kitten } from "./Kitten";
 import { MYTHS } from "./myths";
 import { useMascotMemory } from "./store";
 
-const OUTFIT_IDS = Object.keys(OUTFITS) as (keyof typeof OUTFITS)[];
+const OUTFIT_IDS: (SpecialId | "pyjamas" | "everyday")[] = ["everyday", ...WARDROBE];
+const lookOf = (id: (typeof OUTFIT_IDS)[number]) => (id === "everyday" ? EVERYDAY : wardrobeLook(id));
 
 export function FactBook({ onBack }: { onBack: () => void }) {
   const { t, lang } = useI18n();
@@ -32,7 +34,7 @@ export function FactBook({ onBack }: { onBack: () => void }) {
         <View style={st.wardrobe}>
           {OUTFIT_IDS.map((id) => (
             <View key={id} style={[st.outfit, !worn.has(id) && { opacity: 0.35 }]} accessibilityLabel={`${t.outfitNames[id]}${worn.has(id) ? "" : ` – ${t.factBookLocked}`}`}>
-              <Kitten size={52} mode="sit" facing={0} expression="normal" talking={false} hearts={0} active={false} reduceMotion label={t.outfitNames[id]} outfit={OUTFITS[id]} />
+              <Kitten size={52} mode="sit" facing={0} expression="normal" talking={false} hearts={0} active={false} reduceMotion label={t.outfitNames[id]} outfit={lookOf(id)} />
               <Text style={[s.small, { fontSize: 11, textAlign: "center", marginTop: 4 }]} numberOfLines={2}>{worn.has(id) ? t.outfitNames[id] : t.factBookLocked}</Text>
             </View>
           ))}
