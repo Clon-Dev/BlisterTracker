@@ -30,6 +30,10 @@ Owners track their blister pack, patch, ring or injection; followers (username +
   - Followers also get "not taken yet" 30 min, 1 h or 2 h after the set time.
   - Nothing is sent on pill-free days or once the pill is marked.
 - **Taken**: marking today's pill sets `takenPending`. Within a minute the Worker tells followers "took today's pill at HH:MM", then clears the flag. Undo is possible, and any past pill day can be corrected from the blister or the history calendar.
+- **Followers (owner):** "Manage followers" on the username card opens the list (`src/FollowersScreen.tsx`). Followers appear by username: `users/{pid}/subscribers/{uid}` = `{ key, name?, at? }`. Followers keep `name` current after a rename; the rules allow them to change only the name without the password. Follows from before names show "Follower without a name yet" until that follower opens the new version.
+  - **Remove:** deletes the follow (and its "seen" mark). They can follow again with the username and sharing password.
+  - **Block:** removes them and adds `users/{pid}/blocked/{uid}` = `{ name?, at }`. The rules reject their follow attempts, even with the right password. They aren't notified. If they try, they're told "You can't follow this account": they may read only their own block entry, nothing else. **Unblock** deletes the entry.
+  - UI conventions: [docs/design-guidelines.md](docs/design-guidelines.md).
 - **Seen** (like a read receipt): followers confirm they've seen that today's pill was taken, with the button next to "Taken at …" on the followed schedule or "Mark as seen" on the notification (Android, and desktop/Android browsers; category `seen`). It writes `users/{pid}/seen/{followerUid}` = `{ day, at, name? }` (`name`: the follower's chosen username, else their schedule name). The owner's hero shows "Seen at 13:40" or "Seen by Bob · 13:40". Unfollowing removes it.
 - **Marking a pill** always asks "Just now" or "Earlier…" (time picker capped at the current time; past days can also be saved without a time). This applies to the home screen, the wizard, the blister, the calendar and the notification's "Taken" button, which opens this sheet.
 - **UI**: design tokens in `src/theme.ts` (colors, gradients, Plus Jakarta Sans, shadows). Shared components are in `src/ui.tsx`. In-app bottom sheets and toasts (`src/sheets.tsx`) replace system alerts on every platform. Icons are Lucide.
@@ -172,6 +176,8 @@ node --env-file=.env scripts/test-rules.mjs   # live security-rules test (create
 node scripts/test-schedule.ts                 # unit tests for shared/schedule.ts (packs, breaks, DST, repeats, late alerts)
 node scripts/test-mascot.ts                   # unit tests for the kitten's logic (src/mascot/brain.ts)
 npx tsx scripts/test-export.ts               # unit tests for the export (rows per method, CSV, PDF table)
+node scripts/cleanup-test-accounts.mjs worker/service-account.json           # lists @example.com test accounts (dry run)
+node scripts/cleanup-test-accounts.mjs worker/service-account.json --delete  # …and deletes them; real accounts are never touched
 node scripts/facts-index.ts --check          # validates the kitten's facts and checks the generated fact docs are current
 cd worker && npm run dev                      # local worker; trigger with curl "http://localhost:8787/__scheduled"
                                               # needs worker/.dev.vars: SERVICE_ACCOUNT_JSON='<json on one line>' 

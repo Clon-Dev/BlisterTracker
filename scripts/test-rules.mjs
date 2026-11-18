@@ -178,10 +178,42 @@ try {
   await expect("bob deletes his confirmation when unfollowing", true, () => deleteDoc(seenBob()));
   await expect("bob re-follows alice", true, () => setDoc(doc(bob.db, "users", A, "subscribers", bob.user.uid), { key: key(A, "secret1") }));
   await expect("bob confirms again after re-following", true, () => setDoc(seenBob(), { day: "2026-10-21", at: serverTimestamp() }));
+  // Followers: name shown to the owner, removing, blocking.
+  const subBob = () => doc(bob.db, "users", A, "subscribers", bob.user.uid);
+  const blockBob = (db) => doc(db, "users", A, "blocked", bob.user.uid);
+  await expect("bob follows with his username and the time", true, () => setDoc(subBob(), { key: key(A, "secret1"), name: "Bobby", at: serverTimestamp() }));
+  await expect("bob cannot backdate his follow", false, () => setDoc(subBob(), { key: key(A, "secret1"), name: "Bobby", at: Timestamp.fromMillis(0) }));
+  await expect("bob updates only his shown name (no password needed)", true, () => updateDoc(subBob(), { name: "Bob_2" }));
+  await expect("bob cannot change his key without the password", false, () => updateDoc(subBob(), { key: "f".repeat(64) }));
+  await expect("bob cannot add other fields", false, () => updateDoc(subBob(), { evil: true }));
+  await expect("alice sees her followers' names", true, async () => {
+    const list = await getDocs(collection(alice.db, "users", A, "subscribers"));
+    if (!list.docs.some((d) => d.data().name === "Bob_2")) throw new Error("name missing");
+  });
+  await expect("alice removes bob as a follower", true, () => deleteDoc(doc(alice.db, "users", A, "subscribers", bob.user.uid)));
+  await expect("removed: bob can't read alice's schedule", false, () => getDoc(doc(bob.db, "users", A)));
+  await expect("removed: bob can follow again with the password", true, () => setDoc(subBob(), { key: key(A, "secret1"), name: "Bob_2", at: serverTimestamp() }));
+  await expect("bob cannot block himself out of alice's list or write it", false, () => setDoc(blockBob(bob.db), { at: serverTimestamp() }));
+  await expect("alice blocks bob (removes him and adds the block in one batch)", true, async () => {
+    const batch = writeBatch(alice.db);
+    batch.delete(doc(alice.db, "users", A, "subscribers", bob.user.uid));
+    batch.delete(doc(alice.db, "users", A, "seen", bob.user.uid));
+    batch.set(blockBob(alice.db), { name: "Bob_2", at: serverTimestamp() });
+    await batch.commit();
+  });
+  await expect("blocked: bob cannot follow, even with the right password", false, () => setDoc(subBob(), { key: key(A, "secret1"), name: "Bob_2", at: serverTimestamp() }));
+  await expect("blocked: bob cannot follow the old way (key only) either", false, () => setDoc(subBob(), { key: key(A, "secret1") }));
+  await expect("blocked: bob can read his own block entry (so the app can tell him)", true, async () => { if (!(await getDoc(blockBob(bob.db))).exists()) throw new Error("missing"); });
+  await expect("bob cannot list alice's blocked accounts", false, () => getDocs(collection(bob.db, "users", A, "blocked")));
+  await expect("bob cannot unblock himself", false, () => deleteDoc(blockBob(bob.db)));
+  await expect("alice lists her blocked accounts", true, () => getDocs(collection(alice.db, "users", A, "blocked")));
+  await expect("alice unblocks bob", true, () => deleteDoc(blockBob(alice.db)));
+  await expect("unblocked: bob can follow again with the password", true, () => setDoc(subBob(), { key: key(A, "secret1"), name: "Bob_2", at: serverTimestamp() }));
   await expect("alice deletes all her data in one batch (account deletion)", true, async () => {
     const batch = writeBatch(alice.db);
     (await getDocs(collection(alice.db, "users", A, "subscribers"))).forEach((d) => batch.delete(d.ref));
     (await getDocs(collection(alice.db, "users", A, "seen"))).forEach((d) => batch.delete(d.ref));
+    (await getDocs(collection(alice.db, "users", A, "blocked"))).forEach((d) => batch.delete(d.ref));
     batch.delete(doc(alice.db, "usernames", ukey("alice_93")));
     batch.delete(doc(alice.db, "users", A, "private", "auth"));
     batch.delete(doc(alice.db, "users", A, "notes", "shared"));
@@ -197,6 +229,7 @@ try {
 } finally {
   // Cleanup: subcollections first, then profiles, accounts and the test logins.
   await deleteDoc(doc(bob.db, "users", A, "seen", bob.user.uid)).catch(() => {});
+  await deleteDoc(doc(alice.db, "users", A, "blocked", bob.user.uid)).catch(() => {});
   // Free every name the test may hold (also after a failure), so no orphaned usernames remain.
   const ukeyAll = (u) => [...u].map((c) => { const l = c.toLowerCase(); return [...l].length === 1 ? l : c; }).join("").replace(/%/g, "%25").replace(/\//g, "%2F");
   const testNames = ["Alice_93", "Alice_94", "Bobby!!", "b/o/b~!?#", "xy", "x".repeat(24), "Jörg_Ünal", "Иван_Петров", "さくら・サクラ", "ΣΟΦΙΑ", "Łódź", "İstanbul", "JÖRG_üNAL", "иван_петров", "σοφια", "ŁÓDŹ", "XY"];

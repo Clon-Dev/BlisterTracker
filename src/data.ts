@@ -1,7 +1,7 @@
 import * as Crypto from "expo-crypto";
 import {
-  arrayRemove, arrayUnion, collection, deleteField, doc, getDoc, getDocs, onSnapshot, serverTimestamp, setDoc, Timestamp, updateDoc, writeBatch,
-  type DocumentData, type Unsubscribe,
+  arrayRemove, arrayUnion, collection, deleteDoc, deleteField, doc, getDoc, getDocs, onSnapshot, serverTimestamp, setDoc, Timestamp, updateDoc, writeBatch,
+  type DocumentData, type QueryDocumentSnapshot, type Unsubscribe,
 } from "firebase/firestore";
 import { addDays, dayKey, methodOf, nextLateAt, nextNoticeAt, nextReminderAt, slot, trackFromPackStart, withAction, type Method, type Plan } from "../shared/schedule";
 import { accessKeyFor, decrypt, encrypt, isEncrypted, type Key } from "./crypto";
@@ -84,6 +84,7 @@ const accountRef = (uid: string) => doc(db, "accounts", uid);
 const userRef = (pid: string) => doc(db, "users", pid);
 const authRef = (pid: string) => doc(db, "users", pid, "private", "auth");
 const subscriberRef = (pid: string, uid: string) => doc(db, "users", pid, "subscribers", uid);
+const blockedRef = (pid: string, uid: string) => doc(db, "users", pid, "blocked", uid);
 
 /** Loads the account for this device, claiming a fresh personal ID on first launch. */
 export async function ensureAccount(uid: string, lang: Lang): Promise<Account> {
@@ -133,8 +134,51 @@ export const watchAccount = (uid: string, cb: (a: Account) => void) => resilient
 export const watchProfile = (pid: string, cb: (p: Profile | null) => void, onError?: () => void) => resilient((retry) =>
   onSnapshot(userRef(pid), (s) => cb(s.exists() ? (s.data() as Profile) : null), retry), onError);
 
-export const watchSubscriberCount = (pid: string, cb: (n: number) => void) => resilient((onError) =>
-  onSnapshot(collection(db, "users", pid, "subscribers"), (s) => cb(s.size), onError));
+/** Someone following the own schedule, or blocked from it. `name`: their username (missing for follows from before names). */
+export type Follower = { uid: string; name: string | null; since: number | null };
+const toFollower = (d: QueryDocumentSnapshot<DocumentData>): Follower => {
+  const data = d.data({ serverTimestamps: "estimate" });
+  return { uid: d.id, name: typeof data.name === "string" ? data.name : null, since: data.at instanceof Timestamp ? data.at.toMillis() : null };
+};
+const byName = (a: Follower, b: Follower) => (a.name ?? "\uffff").localeCompare(b.name ?? "\uffff");
+
+/** The own schedule's followers (owner only). */
+export const watchFollowers = (pid: string, cb: (f: Follower[]) => void) => resilient((onError) =>
+  onSnapshot(collection(db, "users", pid, "subscribers"), (s) => cb(s.docs.map(toFollower).sort(byName)), onError));
+/** Accounts blocked from following the own schedule (owner only). */
+export const watchBlocked = (pid: string, cb: (f: Follower[]) => void) => resilient((onError) =>
+  onSnapshot(collection(db, "users", pid, "blocked"), (s) => cb(s.docs.map(toFollower).sort(byName)), onError));
+
+/** Removes a follower (and their "seen" mark). They can follow again with the username and sharing password. */
+export async function removeFollower(pid: string, uid: string) {
+  const batch = writeBatch(db);
+  batch.delete(subscriberRef(pid, uid));
+  batch.delete(seenRef(pid, uid));
+  await batch.commit();
+}
+
+/** Removes a follower and blocks the account: the security rules reject its follow attempts until it's unblocked. */
+export async function blockFollower(pid: string, f: Follower) {
+  const batch = writeBatch(db);
+  batch.delete(subscriberRef(pid, f.uid));
+  batch.delete(seenRef(pid, f.uid));
+  batch.set(blockedRef(pid, f.uid), { ...(f.name ? { name: f.name } : {}), at: serverTimestamp() });
+  await batch.commit();
+}
+
+/** Lets a blocked account follow again (with the username and sharing password, as anyone). */
+export const unblockFollower = (pid: string, uid: string) => deleteDoc(blockedRef(pid, uid));
+
+/**
+ * A follower keeps the name the owner sees up to date: after renaming, and for follows from before names were shown.
+ * Only the name changes (the rules allow nothing else without the password).
+ */
+export async function syncFollowerName(uid: string, subs: string[], name: string) {
+  await Promise.all(subs.map(async (pid) => {
+    const snap = await getDoc(subscriberRef(pid, uid)).catch(() => null);
+    if (snap?.exists() && snap.data().name !== name) await updateDoc(subscriberRef(pid, uid), { name }).catch(() => undefined);
+  }));
+}
 
 // ---------- "Seen" confirmations ----------
 // A follower confirms they've seen that a day's pill was taken (like a read receipt):
@@ -287,10 +331,6 @@ export function recordAction(pid: string, s: Schedule, scheduled: string, done: 
   return updateDoc(userRef(pid), { ...updates, takenPending: doneToday || (s.takenPending && done !== null), ...notificationTimes(plan) });
 }
 
-/**
- * Subscriber doc + the account's list in one atomic batch, so a subscription can never be half done.
- * Throws if the ID/password combination is wrong (the security rules reject the whole batch).
- */
 // ---------- Usernames ----------
 // The personal ID (pid) stays the internal key: schedule doc, follows, access keys, share keys. On top of it every
 // account has a unique username it can change: usernames/{usernameKey(name)} = { pid, ownerUid, username }, and the
@@ -347,10 +387,17 @@ export async function ensureUsername(uid: string, pid: string, profile: Profile)
   }
 }
 
-export async function subscribe(uid: string, pid: string, password: string) {
+/**
+ * Subscriber doc (with the follower's username, shown to the owner) + the account's list in one atomic batch, so a
+ * subscription can never be half done. Throws if the ID/password combination is wrong (the security rules reject the
+ * whole batch), or if the owner blocked this account.
+ */
+export async function subscribe(uid: string, pid: string, password: string, name: string) {
+  // A blocked account may read its own block entry, so it gets a clear answer instead of "wrong password".
+  if ((await getDoc(blockedRef(pid, uid)).catch(() => null))?.exists()) throw new Error(strings().followBlocked);
   const follow = async (key: string) => {
     const batch = writeBatch(db);
-    batch.set(subscriberRef(pid, uid), { key });
+    batch.set(subscriberRef(pid, uid), { key, name, at: serverTimestamp() });
     batch.update(accountRef(uid), { subs: arrayUnion(pid) });
     await batch.commit();
   };
@@ -390,12 +437,13 @@ export const removeToken = (uid: string, token: string) => updateDoc(accountRef(
 
 /** Deletes everything the account owns in one batch: own schedule with its followers and password, follows, the account. */
 export async function deleteAccountData(uid: string, account: Account) {
-  const [followers, seen] = await Promise.all(["subscribers", "seen"].map((c) => getDocs(collection(db, "users", account.pid, c))));
+  const [followers, seen, blocked] = await Promise.all(["subscribers", "seen", "blocked"].map((c) => getDocs(collection(db, "users", account.pid, c))));
   const username = (await getDoc(userRef(account.pid))).data()?.username as string | undefined;
   const batch = writeBatch(db);
   if (username) batch.delete(usernameRef(username));
   followers.forEach((d) => batch.delete(d.ref));
   seen.forEach((d) => batch.delete(d.ref));
+  blocked.forEach((d) => batch.delete(d.ref));
   account.subs.forEach((pid) => { batch.delete(subscriberRef(pid, uid)); batch.delete(seenRef(pid, uid)); });
   batch.delete(authRef(account.pid));
   batch.delete(notesRef(account.pid, "shared"));

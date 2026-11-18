@@ -10,7 +10,7 @@ import { onAuthStateChanged, type User } from "firebase/auth";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
   AlertTriangle, AtSign, BellRing, CalendarDays, CalendarHeart, Check, CheckCheck, Clock3, Copy, Eye, EyeOff, KeyRound, LockKeyhole, MailWarning, Moon, Pencil, Pill, Plus, SkipForward, SlidersHorizontal, Tag,
-  UserMinus, UserPlus, UserRound, type LucideIcon,
+  UserMinus, UserPlus, UserRound, Users, type LucideIcon,
 } from "lucide-react-native";
 import { actionOn, addDays, clock, cycleLength, dayKey, diffDays, doneOn, firstEditableDay, isTaken, methodOf, openActionDay, slot, streak, trackFromPackStart, zonedTime } from "./shared/schedule";
 import { auth } from "./src/firebase";
@@ -23,7 +23,7 @@ import { AuthScreen } from "./src/AuthScreen";
 import { Blister } from "./src/Blister";
 import {
   deviceTz, recordAction, ensureAccount, cleanUsername, ensureUsername, fetchSharing, hasSchedule, markSeen, setUsername, USERNAME_MAX, usernameAvailable, validUsername, migrateToEncryption, openNotes, registerToken, renameSchedule, setAccountLang, setFollowerOnly, setTaken,
-  setTimezone, todayOf, unsubscribe, watchAccount, watchNotes, watchOwnSeen, watchProfile, watchSeen, watchSubscriberCount,
+  setTimezone, todayOf, unsubscribe, watchAccount, watchNotes, watchOwnSeen, watchProfile, watchSeen, watchFollowers, watchBlocked, syncFollowerName, type Follower,
   type Account, type Notes, type Profile, type Schedule, type Seen, type Sharing, type StoredNotes,
 } from "./src/data";
 import { NoteCard, NoteLine, openEarlyPackSheet, SuppliesCard, TravelNotice, UpdateCard, type OwnNote } from "./src/HomeCards";
@@ -36,6 +36,7 @@ import { loadMascot } from "./src/mascot/store";
 import { MascotProvider, MascotSpot, useMascotScroll } from "./src/mascot/world";
 import { PasswordForm, ScheduleWizard, SubscribeForm } from "./src/Forms";
 import { ExportScreen } from "./src/ExportScreen";
+import { FollowersScreen } from "./src/FollowersScreen";
 import { FactBook } from "./src/mascot/FactBook";
 import { HistoryScreen } from "./src/HistoryScreen";
 import { formatDay, loadSavedLang, strings, useI18n, type Lang, type Strings } from "./src/i18n";
@@ -47,7 +48,7 @@ import { C, F, fonts, G, loadAppearance, R, setSystemDark, shadow, themedStyles,
 import { errorText, queued } from "./src/errors";
 import { Badge, Button, Card, Field, IconButton, LanguageSwitch, LinkButton, ProgressRing, s, SectionTitle } from "./src/ui";
 
-type Screen = "home" | "password" | "subscribe" | "schedule" | "account" | "history" | "export" | "factbook";
+type Screen = "home" | "password" | "subscribe" | "schedule" | "account" | "history" | "export" | "factbook" | "followers";
 type Followed = Profile | "denied" | undefined;
 
 /**
@@ -136,7 +137,8 @@ function Main({ user }: { user: User }) {
   const [own, setOwn] = useState<Profile | null>(null);
   const [followed, setFollowed] = useState<Record<string, Followed>>({});
   const [sharing, setSharing] = useState<Sharing>({ set: false, password: null });
-  const [subscriberCount, setSubscriberCount] = useState(0);
+  const [followers, setFollowers] = useState<Follower[]>([]); // the own schedule's followers
+  const [blocked, setBlocked] = useState<Follower[]>([]);
   const [push, setPush] = useState<PushStatus | null>(null);
   const [pushToken, setPushToken] = useState<string | null>(null);
   const [emailVerified, setEmailVerified] = useState(user.emailVerified);
@@ -237,7 +239,7 @@ function Main({ user }: { user: User }) {
   useEffect(() => {
     if (!pid) return;
     const unsubs = [
-      watchProfile(pid, setOwn), watchSubscriberCount(pid, setSubscriberCount), watchSeen(pid, setSeen),
+      watchProfile(pid, setOwn), watchFollowers(pid, setFollowers), watchBlocked(pid, setBlocked), watchSeen(pid, setSeen),
       watchNotes(pid, "shared", setSharedNotes), watchNotes(pid, "private", setPrivateNotes),
     ];
     return () => unsubs.forEach((u) => u());
@@ -253,6 +255,12 @@ function Main({ user }: { user: User }) {
 
   // One live listener per followed schedule.
   const subsKey = account?.subs.join(",") ?? "";
+  // The owners of followed schedules see this account's username in their follower list: keep it current (after a
+  // rename, and for follows from before names were shown).
+  const myUsername = own?.username;
+  useEffect(() => {
+    if (myUsername && subsKey) syncFollowerName(uid, subsKey.split(","), myUsername).catch(() => undefined);
+  }, [myUsername, subsKey]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     const pids = subsKey ? subsKey.split(",") : [];
     setFollowed((f) => Object.fromEntries(pids.map((p) => [p, f[p]])));
@@ -405,8 +413,9 @@ function Main({ user }: { user: User }) {
         onFactBook={() => setScreen("factbook")} />}
       {screen === "export" && <ExportScreen schedule={schedule} notes={ownNotes} name={username} onBack={home} />}
       {screen === "factbook" && <FactBook onBack={home} />}
+      {screen === "followers" && <FollowersScreen pid={account.pid} followers={followers} blocked={blocked} onBack={home} />}
       {screen === "password" && <PasswordForm uid={uid} pid={account.pid} name={username} hasPassword={sharing.set} onSaved={(password) => { setSharing({ set: true, password }); home(); }} onBack={home} />}
-      {screen === "subscribe" && <SubscribeForm uid={uid} ownPid={account.pid} onBack={home} />}
+      {screen === "subscribe" && <SubscribeForm uid={uid} ownPid={account.pid} myName={username} onBack={home} />}
       {screen === "schedule" && <ScheduleWizard uid={uid} pid={account.pid} current={own} width={width} onBack={home} />}
       {screen === "history" && (historySchedule || (historyProfile && historyProfile !== "denied")) && (
         <HistoryScreen schedule={historySchedule} onBack={home} title={historyProfile && historyProfile !== "denied" ? historyProfile.username : undefined}
@@ -475,7 +484,8 @@ function Main({ user }: { user: User }) {
           <LinkButton title={t.notesHistory} icon={CalendarDays} onPress={() => showHistory(account.pid)} />
         </>}
 
-        <MascotSpot id="id"><IdCard username={username} sharing={sharing} followers={subscriberCount} t={t} onPassword={() => setScreen("password")}
+        <MascotSpot id="id"><IdCard username={username} sharing={sharing} followers={followers.length} blocked={blocked.length} t={t} onPassword={() => setScreen("password")}
+          onManageFollowers={() => setScreen("followers")}
           onEditUsername={() => openSheet<void>((done) => <UsernameSheet uid={uid} pid={account.pid} current={username} t={t} done={done} />)} /></MascotSpot>
 
         <Button title={t.followSchedule} icon={UserPlus} onPress={() => setScreen("subscribe")} style={{ marginTop: 18 }} />
@@ -735,8 +745,9 @@ const usernameFontSize = (name: string) => {
   return width <= 8 ? 32 : width <= 12 ? 25 : width <= 18 ? 20 : width <= 26 ? 18 : 15; // long names take two lines
 };
 
-function IdCard({ username, sharing, followers, t, onPassword, onEditUsername }: {
-  username: string; sharing: Sharing; followers: number; t: Strings; onPassword: () => void; onEditUsername: () => void;
+function IdCard({ username, sharing, followers, blocked, t, onPassword, onEditUsername, onManageFollowers }: {
+  username: string; sharing: Sharing; followers: number; blocked: number; t: Strings; onPassword: () => void; onEditUsername: () => void;
+  onManageFollowers: () => void;
 }) {
   const passwordSet = sharing.set;
   const [revealed, setRevealed] = useState(false);
@@ -769,6 +780,7 @@ function IdCard({ username, sharing, followers, t, onPassword, onEditUsername }:
         </View>
       ) : null)}
       <Button title={passwordSet ? t.changePassword : t.setPassword} kind="secondary" compact onPress={onPassword} />
+      {(followers > 0 || blocked > 0) && <LinkButton title={t.manageFollowers} icon={Users} onPress={onManageFollowers} />}
     </Card>
   );
 }

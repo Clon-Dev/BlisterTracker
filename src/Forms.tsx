@@ -50,7 +50,9 @@ export function PasswordForm({ uid, pid, name, hasPassword, onSaved, onBack }: {
   );
 }
 
-export function SubscribeForm({ uid, ownPid, onBack }: { uid: string; ownPid: string; onBack: () => void }) {
+export function SubscribeForm({ uid, ownPid, myName, onBack }: {
+  uid: string; ownPid: string; /** The own username, shown to the owner in their follower list. */ myName: string; onBack: () => void;
+}) {
   const { t } = useI18n();
   const [id, setId] = useState("");
   const [password, setPw] = useState("");
@@ -67,7 +69,7 @@ export function SubscribeForm({ uid, ownPid, onBack }: { uid: string; ownPid: st
       const pid = await resolveUsername(name); // a personal ID from before usernames works too
       if (!pid) throw new Error(t.usernameNotFound);
       if (pid === ownPid) throw new Error(t.ownIdHint);
-      await subscribe(uid, pid, password);
+      await subscribe(uid, pid, password, myName);
       toast(t.followingToast({ name }));
       onBack();
     } catch (e) {
