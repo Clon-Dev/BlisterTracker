@@ -1,19 +1,19 @@
 import { useMemo, useState } from "react";
 import { Pressable, Text, View } from "react-native";
-import { ArrowRight, AtSign, Bandage, BellRing, Check, CheckCircle2, CircleDot, KeyRound, Lock, MessageSquareText, Pill, Repeat, Syringe, Tag, Users, UserPlus, type LucideIcon } from "lucide-react-native";
+import { ArrowRight, AtSign, Bandage, BellRing, Check, CheckCircle2, CircleDot, KeyRound, Lock, MessageSquareText, Pill, Repeat, Syringe, Tag, Trash2, Users, UserPlus, type LucideIcon } from "lucide-react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { actionOn, addDays, clock, cycleLength, dayKey, isTaken, methodOf, METHODS, nextAction, slot, type Method, type Plan } from "../shared/schedule";
 import { Blister } from "./Blister";
 import { DatePicker } from "./DatePicker";
-import { cleanUsername, deviceTz, hasSchedule, prepareSharingPassword, REMINDER_TEXT_MAX, resolveUsername, saveSchedule, subscribe, textLength, USERNAME_MAX, USERNAME_MIN, type Profile } from "./data";
+import { cleanUsername, deleteSchedule, deviceTz, hasSchedule, prepareSharingPassword, REMINDER_TEXT_MAX, resolveUsername, saveSchedule, subscribe, textLength, USERNAME_MAX, USERNAME_MIN, type Profile } from "./data";
 import { formatDay, useI18n } from "./i18n";
 import { actionKey } from "./methods/status";
 import { packCells } from "./pack";
-import { alert, toast } from "./sheets";
+import { alert, confirm, toast } from "./sheets";
 import { defaultEarlier, EarlierPicker, TimeDial } from "./TakenTime";
 import { C, F, G, R, shadow, themedStyles } from "./theme";
 import { errorText, queued } from "./errors";
-import { Button, Card, ChipGroup, Field, Header, s, Stepper, Toggle } from "./ui";
+import { Button, Card, ChipGroup, Field, Header, LinkButton, s, Stepper, Toggle } from "./ui";
 
 export function PasswordForm({ uid, pid, name, hasPassword, onSaved, onBack }: {
   uid: string; pid: string; /** The username others follow with. */ name: string; hasPassword: boolean; onSaved: (password: string) => void; onBack: () => void;
@@ -159,8 +159,10 @@ const layoutOf = (l: Layout): Layout => ({ pillsPerPack: l.pillsPerPack, placebo
 const defaultLayout = (m: Method): Layout =>
   layoutOf(m === "pill" ? PRESETS[0] : m === "injection" ? { pillsPerPack: 84, placebo: 0, breakDays: 0 } : VARIANTS[m][0]);
 
-export function ScheduleWizard({ uid, pid, current, width, onBack }: {
+export function ScheduleWizard({ uid, pid, current, width, onBack, onDeleted }: {
   uid: string; pid: string; current: Profile | null; width: number; onBack: () => void;
+  /** After the own schedule was deleted (the home screen then hides the setup card). */
+  onDeleted: () => void;
 }) {
   const { t, lang } = useI18n();
   const existing = hasSchedule(current) ? current : null;
@@ -245,6 +247,14 @@ export function ScheduleWizard({ uid, pid, current, width, onBack }: {
         <Field label={t.nameLabel} icon={Tag} value={name} onChangeText={setName} maxLength={30} placeholder={method === "pill" ? pid : t.methods[method].name} />
       </Card>
       {next}
+      {existing && current && (
+        <View style={{ marginTop: 18 }}><LinkButton title={t.deleteSchedule} icon={Trash2} color={C.danger} onPress={async () => {
+          if (!(await confirm({ title: t.deleteScheduleTitle, message: t.deleteScheduleBody, confirmLabel: t.deleteScheduleConfirm, destructive: true, icon: Trash2 }))) return;
+          queued(deleteSchedule(pid, current));
+          toast(t.scheduleDeleted);
+          onDeleted();
+        }} /></View>
+      )}
     </View>
   );
 

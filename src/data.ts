@@ -233,7 +233,18 @@ export async function prepareSharingPassword(uid: string, pid: string, password:
   };
 }
 
-export const renameSchedule = (pid: string, name: string) => updateDoc(userRef(pid), { name: name.trim() });
+/**
+ * Deletes the own schedule: its reminders, taken history, supplies and appointment. The profile stays without a
+ * schedule, so the username, sharing password (share-key wrap), followers and notes keep working.
+ */
+export const deleteSchedule = (pid: string, profile: Profile) => setDoc(userRef(pid), {
+  ownerUid: profile.ownerUid,
+  ...(profile.shareKeyWrap ? { shareKeyWrap: profile.shareKeyWrap } : {}),
+  ...(profile.username ? { username: profile.username } : {}),
+  ...(profile.usernameKey ? { usernameKey: profile.usernameKey } : {}),
+});
+
+export const renameSchedule =(pid: string, name: string) => updateDoc(userRef(pid), { name: name.trim() });
 
 /** Language for this account's push notifications (read by the worker). */
 export const setAccountLang = (uid: string, lang: Lang) => updateDoc(accountRef(uid), { lang });

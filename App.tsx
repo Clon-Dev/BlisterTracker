@@ -416,7 +416,8 @@ function Main({ user }: { user: User }) {
       {screen === "followers" && <FollowersScreen pid={account.pid} followers={followers} blocked={blocked} onBack={home} />}
       {screen === "password" && <PasswordForm uid={uid} pid={account.pid} name={username} hasPassword={sharing.set} onSaved={(password) => { setSharing({ set: true, password }); home(); }} onBack={home} />}
       {screen === "subscribe" && <SubscribeForm uid={uid} ownPid={account.pid} myName={username} onBack={home} />}
-      {screen === "schedule" && <ScheduleWizard uid={uid} pid={account.pid} current={own} width={width} onBack={home} />}
+      {screen === "schedule" && <ScheduleWizard uid={uid} pid={account.pid} current={own} width={width} onBack={home}
+        onDeleted={() => { changeFollowerOnly(true); home(); }} />}
       {screen === "history" && (historySchedule || (historyProfile && historyProfile !== "denied")) && (
         <HistoryScreen schedule={historySchedule} onBack={home} title={historyProfile && historyProfile !== "denied" ? historyProfile.username : undefined}
           onExport={historyOf === account.pid ? () => setScreen("export") : undefined}

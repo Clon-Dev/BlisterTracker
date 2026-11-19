@@ -209,6 +209,16 @@ try {
   await expect("alice lists her blocked accounts", true, () => getDocs(collection(alice.db, "users", A, "blocked")));
   await expect("alice unblocks bob", true, () => deleteDoc(blockBob(alice.db)));
   await expect("unblocked: bob can follow again with the password", true, () => setDoc(subBob(), { key: key(A, "secret1"), name: "Bob_2", at: serverTimestamp() }));
+  // Deleting the own schedule (src/data.ts deleteSchedule): the profile stays with username and share-key wrap only.
+  const { ownerUid, shareKeyWrap, username, usernameKey } = (await getDoc(doc(alice.db, "users", A))).data();
+  const scheduleless = { ownerUid, shareKeyWrap, username, usernameKey };
+  await expect("bob cannot delete alice's schedule", false, () => setDoc(doc(bob.db, "users", A), scheduleless));
+  await expect("alice deletes her schedule, keeping username and share-key wrap", true, () => setDoc(doc(alice.db, "users", A), scheduleless));
+  await expect("…bob still follows and reads her profile and shared notes", true, async () => {
+    const p = (await getDoc(doc(bob.db, "users", A))).data();
+    if (p.packStart || p.username !== username) throw new Error("unexpected profile");
+    await getDoc(doc(bob.db, "users", A, "notes", "shared"));
+  });
   await expect("alice deletes all her data in one batch (account deletion)", true, async () => {
     const batch = writeBatch(alice.db);
     (await getDocs(collection(alice.db, "users", A, "subscribers"))).forEach((d) => batch.delete(d.ref));

@@ -57,7 +57,7 @@ management screen). Change this file when a convention changes.
   below (e.g. "Following since 3 November 2026"). Blocked people use a grey avatar and `C.textSoft` name.
 - **Icons:** Lucide only. 18–20 px at 2.3–2.4 stroke in cards, 26 px in sheet icons. Each icon gets a meaning that stays
   the same across the app:
-  - `UserPlus` follow; `UserMinus` unfollow or remove; `Ban` block; `ShieldCheck` unblock.
+  - `UserPlus` follow; `UserMinus` unfollow or remove; `Ban` block; `ShieldCheck` unblock; `Trash2` delete.
   - `Users` followers; `CalendarDays` history; `Pencil` edit; `Copy` copy; `KeyRound` sharing password; `FileDown` export.
 
 ## Feedback and flow
